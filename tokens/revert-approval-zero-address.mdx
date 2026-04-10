@@ -1,0 +1,93 @@
+---
+title: "ERC20 Tokens That Revert on Approval to Zero Address"
+description: "Certain ERC20 tokens revert when approve(address(0), amount) is called, breaking contracts that use the zero address to revoke or clear allowances."
+---
+
+A subset of ERC20 tokens will revert if the spender argument to `approve()` is `address(0)`. This behavior is most common in tokens built on top of OpenZeppelin's ERC20 base contract, which has included this guard since early versions of the library. From a security standpoint the restriction is reasonable — approving the zero address is almost always a programmer error — but it creates compatibility issues for contracts that use `approve(address(0), 0)` as a conventional way to revoke or clear an allowance, or for protocols that pass a spender address through without validation and may inadvertently supply the zero address.
+
+## Affected Tokens
+
+| Token | Notes |
+|-------|-------|
+| OpenZeppelin-based tokens | Any token inheriting from OpenZeppelin `ERC20.sol` v4.x or later includes this check by default |
+
+<Note>
+  The OpenZeppelin guard exists in `_approve`, so it fires for both direct `approve()` calls and for `transferFrom` paths that internally adjust allowances (in implementations that call `_approve` internally).
+</Note>
+
+## Contract Implementation
+
+The reference implementation adds a single `require` before delegating to the base approval logic. The check is intentionally minimal: it only validates the spender address, leaving all other ERC20 semantics untouched.
+
+```solidity
+// Copyright (C) 2020 d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+import {ERC20} from "./ERC20.sol";
+
+contract ApprovalToZeroAddressToken is ERC20 {
+    // --- Init ---
+    constructor(uint _totalSupply) ERC20(_totalSupply) public {}
+
+    // --- Token ---
+    function approve(address usr, uint wad) override public returns (bool) {
+        require(usr != address(0), "no approval for the zero address");
+        return super.approve(usr, wad);
+    }
+}
+```
+
+## Integration Risks
+
+**Allowance-clearing patterns may break.** Some integrations clear allowances by calling `approve(address(0), 0)` under the assumption that any token will accept it. Tokens with this guard will revert that call.
+
+**Unvalidated spender arguments.** Protocol contracts that accept a spender address as a user-supplied parameter and pass it directly to `approve` — without sanitizing for the zero address — will revert if a user or external system supplies `address(0)`. This can be triggered accidentally or as a griefing vector.
+
+**Factory and proxy patterns.** Contracts that predictively deploy token approvals before a spender's address is finalized, and use `address(0)` as a sentinel, will encounter issues at the approval stage.
+
+<Warning>
+  Relying on `approve(address(0), ...)` to signal "no approval" or as a revocation primitive is not portable across ERC20 tokens. Tokens with this guard will revert; tokens without it will simply write a zero-address entry to the allowances mapping, which is functionally harmless but semantically meaningless.
+</Warning>
+
+## Defensive Measures
+
+The fix is to validate the spender address before issuing any approval. This check should be applied at every protocol boundary where a spender address is accepted from an external source or constructed dynamically.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IERC20} from "./IERC20.sol";
+
+/// @notice Approve a spender only if the address is valid (non-zero).
+/// @param token   The ERC20 token to approve.
+/// @param spender The address to grant spending rights.
+/// @param amount  The allowance to set.
+function safeApproveNonZero(
+    IERC20 token,
+    address spender,
+    uint256 amount
+) internal {
+    require(spender != address(0), "approve: spender is zero address");
+    token.approve(spender, amount);
+}
+```
+
+For contracts that conditionally need to skip an approval when no spender exists, use an explicit zero-address sentinel check rather than issuing the approval at all:
+
+```solidity
+// Pattern: skip approval when spender is not yet known
+function maybeApprove(IERC20 token, address spender, uint256 amount) internal {
+    if (spender == address(0)) {
+        // No spender configured yet — skip rather than revert
+        return;
+    }
+    token.approve(spender, amount);
+}
+```
+
+<Tip>
+  When writing tests that cover token approval paths, always include a test case where `spender == address(0)` to confirm that your contract handles it gracefully — either by reverting with a useful message or by skipping the operation — rather than propagating an opaque revert from the token.
+</Tip>

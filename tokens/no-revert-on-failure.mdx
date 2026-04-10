@@ -1,0 +1,135 @@
+---
+title: "Tokens That Signal Failure With False Instead of Revert"
+description: "ZRX and EURS return false on failure rather than reverting. Integrations that skip the return-value check silently accept failure and continue executing."
+---
+
+The ERC20 standard technically permits `transfer` and `transferFrom` to signal failure by returning `false` rather than reverting. While this is compliant with the letter of the specification, it is at odds with how most Solidity code is written: developers commonly call `token.transfer(...)` without checking the return value, relying on the convention that a failed call reverts. When a token instead returns `false` and continues, the calling contract proceeds as if the transfer succeeded, which can result in lost funds, incorrect accounting, or protocol insolvency. This page covers ZRX and EURS as canonical examples, provides the reference implementation, and shows how to write integrations that handle `false` returns correctly.
+
+## Real-world examples
+
+| Token | Behavior |
+|-------|----------|
+| ZRX (0x) | Returns `false` on failed `transfer` / `transferFrom` instead of reverting |
+| EURS (Stasis Euro) | Returns `false` on failed `transfer` / `transferFrom` instead of reverting |
+
+<Note>
+This behavior is technically ERC20-compliant. The standard says these functions "MUST return true on success" but does not prohibit returning false on failure instead of reverting. However, common Solidity coding practice treats a non-reverting call as a success unless the code explicitly checks the return value.
+</Note>
+
+## Contract implementation
+
+`NoRevertToken` returns `false` instead of reverting in three failure cases: insufficient source balance, destination balance overflow, and insufficient allowance. On success, it returns `true`.
+
+```solidity
+// Copyright (C) 2017, 2018, 2019, 2020 dbrock, rain, mrchico, d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+contract NoRevertToken {
+    // --- ERC20 Data ---
+    string  public constant name = "Token";
+    string  public constant symbol = "TKN";
+    uint8   public decimals = 18;
+    uint256 public totalSupply;
+
+    mapping (address => uint)                      public balanceOf;
+    mapping (address => mapping (address => uint)) public allowance;
+
+    event Approval(address indexed src, address indexed guy, uint wad);
+    event Transfer(address indexed src, address indexed dst, uint wad);
+
+    // --- Init ---
+    constructor(uint _totalSupply) public {
+        totalSupply = _totalSupply;
+        balanceOf[msg.sender] = _totalSupply;
+        emit Transfer(address(0), msg.sender, _totalSupply);
+    }
+
+    // --- Token ---
+    function transfer(address dst, uint wad) external returns (bool) {
+        return transferFrom(msg.sender, dst, wad);
+    }
+    function transferFrom(address src, address dst, uint wad) virtual public returns (bool) {
+        if (balanceOf[src] < wad) return false;                        // insufficient src bal
+        if (balanceOf[dst] >= (type(uint256).max - wad)) return false; // dst bal too high
+
+        if (src != msg.sender && allowance[src][msg.sender] != type(uint).max) {
+            if (allowance[src][msg.sender] < wad) return false;        // insufficient allowance
+            allowance[src][msg.sender] = allowance[src][msg.sender] - wad;
+        }
+
+        balanceOf[src] = balanceOf[src] - wad;
+        balanceOf[dst] = balanceOf[dst] + wad;
+
+        emit Transfer(src, dst, wad);
+        return true;
+    }
+    function approve(address usr, uint wad) virtual external returns (bool) {
+        allowance[msg.sender][usr] = wad;
+        emit Approval(msg.sender, usr, wad);
+        return true;
+    }
+}
+```
+
+Key observations:
+- `transferFrom` returns `false` without reverting on three distinct failure paths.
+- No state is modified when `false` is returned; balances and allowances remain unchanged.
+- The function does not emit a `Transfer` event on failure, which can make failed transfers harder to detect off-chain.
+
+## Integration risks
+
+**Unchecked transfer.** The single most common mistake is calling `token.transfer(recipient, amount)` without wrapping it in a `require`. The transaction completes successfully from the EVM's perspective; the calling contract simply never received the tokens.
+
+```solidity
+// DANGEROUS: return value is discarded
+token.transfer(recipient, amount);
+// Execution continues even if transfer returned false
+```
+
+**Withdraw-without-transfer.** In a withdrawal function that calls `token.transfer` before clearing the user's balance, a `false` return means the user keeps their on-chain balance record while the transfer silently did nothing. If the contract then subtracts the balance anyway, funds are lost; if it does not, the user can attempt repeated withdrawals.
+
+**Allowance drain assumption.** Code that assumes a `transferFrom` returning `false` has still consumed the allowance (some tokens partially execute) will grant unintended repeated access.
+
+## Defensive measures
+
+### Wrap in require
+
+The simplest fix for tokens that are known to conform to the standard return type:
+
+```solidity
+// Correct: revert if the token signals failure
+require(token.transfer(recipient, amount), "transfer failed");
+require(token.transferFrom(sender, address(this), amount), "transferFrom failed");
+```
+
+### Use SafeERC20
+
+OpenZeppelin's `SafeERC20` handles both the missing-return and false-return cases with a single wrapper:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+contract CheckedTransfer {
+    using SafeERC20 for IERC20;
+
+    function sendTokens(IERC20 token, address recipient, uint256 amount) external {
+        // Reverts if transfer returns false OR if it returns no data
+        token.safeTransfer(recipient, amount);
+    }
+
+    function pullTokens(IERC20 token, address sender, uint256 amount) external {
+        // Reverts if transferFrom returns false OR if it returns no data
+        token.safeTransferFrom(sender, address(this), amount);
+    }
+}
+```
+
+<Tip>
+Default to `SafeERC20` for every token interaction in new contracts. It handles missing return values, false return values, and revert-on-failure all in one wrapper, and adds negligible gas overhead.
+</Tip>

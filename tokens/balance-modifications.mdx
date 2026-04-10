@@ -1,0 +1,84 @@
+---
+title: 'Tokens That Modify Balances Outside of Transfers'
+description: 'Rebasing tokens like AMPL and airdrop tokens like COMP change balances without Transfer events, silently invalidating protocols that cache token balances.'
+---
+
+Some tokens can modify account balances through mechanisms completely separate from `transfer` or `transferFrom`. Rebasing tokens like Ampleforth adjust every holder's balance proportionally on a scheduled cadence. Governance tokens like COMP distribute airdrops by directly crediting balances. Mintable and burnable tokens let privileged addresses inflate or deflate supply at will. In all of these cases, a balance can change without any `Transfer` event being emitted, silently invalidating any assumption that cached balances remain accurate between explicit transfers.
+
+## Real-world examples
+
+| Token | Mechanism | Notes |
+|---|---|---|
+| **Ampleforth (AMPL)** | Rebasing | Daily supply adjustments scale every holder's balance up or down proportionally |
+| **Compound (COMP)** | Governance airdrop | Retroactive distributions credited balances outside of normal transfers |
+| **USDC / USDT** | Mintable/burnable | Privileged minting and burning can change total supply and individual balances |
+
+## How balance modifications work
+
+Unlike a normal transfer, which moves value from one address to another and emits a `Transfer` event, rebasing tokens mutate all balances simultaneously by updating a global scaling factor. The token contract stores each user's "shares" and multiplies them by the current rebase scalar to compute the reported balance.
+
+```solidity
+// Pseudo-code: simplified rebasing token mechanics
+
+uint256 public totalSupply;
+uint256 internal _rebaseFactor; // scaled by 1e18
+
+mapping(address => uint256) internal _shares;
+
+function balanceOf(address account) public view returns (uint256) {
+    // Reported balance = shares * rebaseFactor
+    return (_shares[account] * _rebaseFactor) / 1e18;
+}
+
+function rebase(uint256 newTotalSupply) external onlyPolicy {
+    // Adjusts every holder's balance without a Transfer event
+    _rebaseFactor = (newTotalSupply * 1e18) / _totalShares;
+    totalSupply = newTotalSupply;
+    emit LogRebase(epoch, newTotalSupply);
+}
+```
+
+After `rebase()` executes, `balanceOf(anyAccount)` returns a different value than it did before — with no `Transfer` event and no on-chain record of the change visible to contracts that were not listening for `LogRebase`.
+
+## Ampleforth and DEX pool special-casing
+
+Because rebasing silently invalidates cached balances, Ampleforth worked directly with Balancer and Uniswap V2 to special-case their pools. The rebase procedure atomically calls into each pool to sync its cached reserves immediately after the rebase occurs, preventing the pool from operating with stale accounting. Not all rebasing tokens take this precaution — and not all AMMs support such callbacks.
+
+<Warning>
+Any protocol that caches a token balance in storage and later uses that cached value for arithmetic is vulnerable to stale-balance errors when the token rebases or an airdrop occurs between the read and the use. This includes AMMs (Balancer, Uniswap V2), lending protocols, and vault-style contracts.
+</Warning>
+
+## Integration risks
+
+**Stale cached reserves in AMMs.** Uniswap V2 stores `reserve0` and `reserve1` in storage. If a rebase occurs between two swaps, the cached reserves no longer match actual `balanceOf` values. Arbitrageurs can exploit the discrepancy, and the pool's invariant calculations break.
+
+**Incorrect accounting in vaults.** A vault that records `deposited[user] = token.balanceOf(address(this))` at deposit time will over- or under-credit users after a rebase, since the actual balance held by the vault has changed.
+
+**Misleading share-price calculations.** Any protocol computing a share price as `totalAssets / totalShares` will produce incorrect results if `totalAssets` is fetched once and then reused across a rebase boundary.
+
+**Airdrop inflation.** Governance token airdrops may silently inflate the balances of contracts holding those tokens, creating accounting mismatches in systems that track deposits separately from live balances.
+
+## Defensive measures
+
+<Tip>
+Always re-read `balanceOf` immediately before using a balance in a computation. Never store a balance in a local or storage variable and reuse it across multiple operations or transactions.
+</Tip>
+
+**Use live balances, not deltas.** Instead of crediting a user with the `amount` they passed to a deposit function, compute the actual change:
+
+```solidity
+// Safe deposit accounting for fee-on-transfer and rebasing tokens
+function deposit(address token, uint256 amount) external {
+    uint256 before = IERC20(token).balanceOf(address(this));
+    IERC20(token).transferFrom(msg.sender, address(this), amount);
+    uint256 received = IERC20(token).balanceOf(address(this)) - before;
+    // Credit user with `received`, not `amount`
+    shares[msg.sender] += received;
+}
+```
+
+**Call `sync()` before sensitive operations.** AMMs that expose a `sync()` function (as Uniswap V2 does) should have it called before any balance-sensitive operation to flush stale reserves.
+
+**Use an allowlist.** If your protocol cannot safely handle rebasing tokens, maintain an allowlist of supported tokens and reject deposits of assets that exhibit this behavior. An off-chain UI allowlist can protect unsophisticated users without requiring on-chain governance.
+
+**Emit and listen for rebase events.** If you are building a protocol that must support rebasing tokens, subscribe to the token's rebase event and trigger a reserve sync in the same transaction.

@@ -1,0 +1,282 @@
+---
+title: "Safe ERC20 Token Integration Patterns for Solidity"
+description: "Defensive Solidity patterns for handling non-standard ERC20 behavior: allowlists, wrapper contracts, safe transfer wrappers, and balance-delta checking."
+---
+
+Because the ERC20 specification is loosely defined and widely violated, building a robust smart contract that interacts with arbitrary tokens requires deliberate defensive design. The patterns on this page range from strict (allow only pre-vetted tokens) to adaptive (handle any token defensively at runtime). Choose the right combination based on whether your system needs to be permissionless or can operate with a managed token set.
+
+## Pattern 1: Contract-level token allowlist
+
+The most effective protection against unexpected token behavior is to restrict which tokens your contract accepts. If your system is not required to be permissionless, an on-chain allowlist eliminates entire classes of risk.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract TokenAllowlist {
+    address public owner;
+    mapping(address => bool) public allowedTokens;
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
+    // Only the owner can add tokens after vetting their behavior
+    function addToken(address token) external onlyOwner {
+        allowedTokens[token] = true;
+    }
+
+    function removeToken(address token) external onlyOwner {
+        allowedTokens[token] = false;
+    }
+
+    modifier onlyAllowedToken(address token) {
+        require(allowedTokens[token], "token not allowed");
+        _;
+    }
+
+    function deposit(address token, uint256 amount)
+        external
+        onlyAllowedToken(token)
+    {
+        // Safe to proceed — token has been reviewed
+        IERC20(token).transferFrom(msg.sender, address(this), amount);
+    }
+}
+```
+
+<Note>
+Even when an on-chain allowlist is not feasible (for example, in a permissionless AMM), an off-chain allowlist in the official UI can protect unsophisticated users from tokens that violate contract expectations while preserving contract-level permissionlessness.
+</Note>
+
+<Tabs>
+  <Tab title="When to use">
+    - Lending protocols with a fixed set of collateral tokens
+    - Yield aggregators that only support audited assets
+    - Any system where centralized or governance-controlled token admission is acceptable
+    - Bridges with a defined list of supported assets
+  </Tab>
+  <Tab title="When it falls short">
+    - Permissionless AMMs where any user can create a pool
+    - Protocols that compete on breadth of supported tokens
+    - Systems where governance-controlled allowlists introduce unacceptable centralization risk
+  </Tab>
+</Tabs>
+
+## Pattern 2: Wrapper contract isolation
+
+When your core business logic must remain pure, isolate all external token interaction in a dedicated wrapper contract at the edge of the system. The core contract only ever calls the wrapper, which normalizes token behavior and presents a consistent interface inward.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+/// @notice Edge wrapper that normalizes ERC20 behavior for the core system.
+/// The core contract never calls token contracts directly.
+contract TokenEdge {
+    /// @notice Pull tokens from sender, return the actual amount received.
+    /// Handles fee-on-transfer and missing return values.
+    function pullToken(
+        address token,
+        address from,
+        uint256 requestedAmount
+    ) external returns (uint256 received) {
+        uint256 balBefore = IERC20(token).balanceOf(address(this));
+        _safeTransferFrom(token, from, address(this), requestedAmount);
+        uint256 balAfter = IERC20(token).balanceOf(address(this));
+        received = balAfter - balBefore;
+    }
+
+    /// @notice Push tokens to recipient, reverting if the call fails.
+    function pushToken(
+        address token,
+        address to,
+        uint256 amount
+    ) external {
+        _safeTransfer(token, to, amount);
+    }
+
+    // --- internal safe transfer helpers ---
+
+    function _safeTransfer(address token, address to, uint256 value) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20.transfer.selector, to, value)
+        );
+        require(
+            success && (data.length == 0 || abi.decode(data, (bool))),
+            "safeTransfer failed"
+        );
+    }
+
+    function _safeTransferFrom(
+        address token,
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(
+                IERC20.transferFrom.selector,
+                from,
+                to,
+                value
+            )
+        );
+        require(
+            success && (data.length == 0 || abi.decode(data, (bool))),
+            "safeTransferFrom failed"
+        );
+    }
+}
+```
+
+<Tabs>
+  <Tab title="When to use">
+    - Any system complex enough that keeping token interaction logic spread across the codebase creates audit surface
+    - Protocols that want to swap out token handling logic without touching core accounting
+    - Systems that need to support both standard and non-standard tokens via configurable adapters
+  </Tab>
+  <Tab title="When it falls short">
+    - Gas-sensitive code where the extra call overhead is unacceptable
+    - Very simple contracts where a wrapper adds more complexity than it removes
+  </Tab>
+</Tabs>
+
+## Pattern 3: Safe transfer with low-level call
+
+When you cannot use a wrapper contract, the minimum you must do is replace direct `IERC20.transfer` calls with a safe transfer function that handles both missing return values and explicit `false` returns. This is the approach used by Uniswap V2.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+library SafeTransferLib {
+    /// @notice Transfer tokens, handling tokens that return nothing (USDT, BNB)
+    /// and tokens that return true correctly. Does NOT handle tokens that
+    /// return false on success (e.g., Tether Gold / ReturnsFalse).
+    function safeTransfer(
+        address token,
+        address to,
+        uint256 value
+    ) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(
+                bytes4(keccak256("transfer(address,uint256)")),
+                to,
+                value
+            )
+        );
+        require(
+            success && (data.length == 0 || abi.decode(data, (bool))),
+            "safeTransfer: transfer failed"
+        );
+    }
+
+    /// @notice TransferFrom tokens with the same safe-return handling.
+    function safeTransferFrom(
+        address token,
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(
+                bytes4(keccak256("transferFrom(address,address,uint256)")),
+                from,
+                to,
+                value
+            )
+        );
+        require(
+            success && (data.length == 0 || abi.decode(data, (bool))),
+            "safeTransferFrom: transfer failed"
+        );
+    }
+}
+```
+
+<Warning>
+This pattern correctly handles tokens with missing return values (`MissingReturns`) and tokens that return `true` on success. It does **not** correctly handle Tether Gold (`ReturnsFalse`), which declares a `bool` return but always returns `false` even when the transfer succeeded. No single safe-transfer wrapper can handle both behaviors correctly — if you want to support Tether Gold, you must use balance-delta checking (Pattern 4) and ignore the return value entirely.
+</Warning>
+
+<Tabs>
+  <Tab title="When to use">
+    - Replacing bare `IERC20(token).transfer(...)` calls in existing code
+    - Libraries shared across many contracts that cannot assume wrapped tokens
+    - Any contract that must support `USDT` or `BNB` out of the box
+  </Tab>
+  <Tab title="When it falls short">
+    - When you need to detect the actual amount received (use Pattern 4)
+    - When the token set includes Tether Gold or any `ReturnsFalse`-style token
+  </Tab>
+</Tabs>
+
+## Pattern 4: Balance-delta checking
+
+For fee-on-transfer tokens, the only reliable way to determine the actual amount received is to measure the balance before and after the transfer. Credit users and update internal accounting based on the measured delta, not the requested amount.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IERC20 {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+contract FeeAwareVault {
+    mapping(address => mapping(address => uint256)) public deposits;
+
+    function deposit(address token, uint256 requestedAmount) external {
+        uint256 balBefore = IERC20(token).balanceOf(address(this));
+
+        // Use a safe transferFrom in practice; simplified here for clarity
+        IERC20(token).transferFrom(msg.sender, address(this), requestedAmount);
+
+        uint256 balAfter = IERC20(token).balanceOf(address(this));
+        uint256 received = balAfter - balBefore; // actual amount received
+
+        // Credit user with received, not requestedAmount
+        deposits[token][msg.sender] += received;
+    }
+
+    function withdraw(address token, uint256 amount) external {
+        require(deposits[token][msg.sender] >= amount, "insufficient balance");
+        deposits[token][msg.sender] -= amount;
+
+        uint256 balBefore = IERC20(token).balanceOf(address(this));
+        IERC20(token).transfer(msg.sender, amount);
+        uint256 balAfter = IERC20(token).balanceOf(address(this));
+
+        // Confirm that the contract's balance decreased by at least the amount
+        require(balBefore - balAfter >= amount, "transfer amount mismatch");
+    }
+}
+```
+
+<Note>
+Balance-delta checking also serves as the correct approach for `ReturnsFalse`-style tokens, since you can verify the transfer occurred by observing the balance change rather than trusting the return value. Combine this with safe-transfer (Pattern 3) for maximum coverage.
+</Note>
+
+<Tabs>
+  <Tab title="When to use">
+    - Vault, lending, or staking contracts that accept arbitrary tokens
+    - Any contract that credits internal user balances based on received token amounts
+    - Protocols explicitly designed to support fee-on-transfer tokens like STA or PAXG
+  </Tab>
+  <Tab title="When it falls short">
+    - Contracts that call `transferFrom` and then immediately use the amount in the same transaction without storing it — the two `balanceOf` calls add gas overhead
+    - Tokens that modify balances in a way that makes before/after snapshots unreliable (e.g., rebasing tokens that rebase mid-transaction, which is extremely rare)
+  </Tab>
+</Tabs>

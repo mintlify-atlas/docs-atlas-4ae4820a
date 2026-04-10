@@ -1,0 +1,151 @@
+---
+title: "Tokens That Revert When the Transfer Amount Is Zero"
+description: "LEND reverts on zero-value transfers. Contracts that call transfer unconditionally without a zero-amount guard will revert on every use of these tokens."
+---
+
+Most ERC20 tokens permit zero-value transfers as a no-op—the call succeeds, a `Transfer(src, dst, 0)` event is emitted, and no balances change. Some tokens, however, treat a zero-value transfer as an error and revert the entire transaction. LEND (Aave's original governance token) is the canonical example. This behavior is not mandated or prohibited by the ERC20 standard, but it can silently break protocols that conditionally issue zero-value transfers without guarding against the revert. This page covers the implementation, the integration risks, and how to guard against unexpected reverts.
+
+## Real-world examples
+
+| Token | Behavior |
+|-------|----------|
+| LEND (Aave v1 governance token) | Reverts when `transfer` or `transferFrom` is called with `wad == 0` |
+
+<Note>
+The ERC20 standard does not specify whether zero-value transfers must succeed or may revert. Both behaviors exist in production tokens. Protocols that aim to support arbitrary tokens must handle both cases.
+</Note>
+
+## Contract implementation
+
+`RevertZeroToken` overrides `transferFrom` to add a single guard before delegating to the base implementation. If `wad` is zero, it reverts with `"zero-value-transfer"`.
+
+```solidity
+// Copyright (C) 2020 d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+import {ERC20} from "./ERC20.sol";
+
+contract RevertZeroToken is ERC20 {
+    // --- Init ---
+    constructor(uint _totalSupply) ERC20(_totalSupply) public {}
+
+    // --- Token ---
+    function transferFrom(address src, address dst, uint wad) override public returns (bool) {
+        require(wad != 0, "zero-value-transfer");
+        return super.transferFrom(src, dst, wad);
+    }
+}
+```
+
+Key observations:
+- The guard fires before any balance or allowance check, so even a zero-value transfer between two addresses with zero balance reverts.
+- `transfer` is not independently overridden; it delegates to `transferFrom` via the base `ERC20.transfer`, so zero-value calls through `transfer` also revert.
+- No state is modified before the revert; the transaction is fully atomic.
+
+## Integration risks
+
+**Unconditional reward distribution.** A staking contract that calls `token.transfer(user, reward)` at the end of every interaction will revert for any user whose accrued reward is currently zero. This locks the user out of all other operations in the same transaction.
+
+**Batch processing failure.** A contract that iterates over a list of recipients and transfers tokens to each will abort the entire batch if any single recipient is owed zero tokens.
+
+**Fee settlement.** Protocols that periodically settle fees by transferring accumulated amounts will fail silently (or loudly) if the accumulated amount rounds down to zero.
+
+**Token migration flows.** Migration contracts that call `transfer(newToken, balance)` during a token swap may encounter zero-balance accounts and revert before completing the migration.
+
+## Defensive measures
+
+### Guard before every transfer
+
+Check that the amount is non-zero before calling `transfer` or `transferFrom`:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+contract ZeroSafeDistributor {
+    using SafeERC20 for IERC20;
+
+    mapping(address => uint256) public pendingRewards;
+
+    function claimReward(IERC20 token) external {
+        uint256 reward = pendingRewards[msg.sender];
+
+        // Guard: skip the transfer entirely if there is nothing to send
+        if (reward == 0) return;
+
+        pendingRewards[msg.sender] = 0;
+        token.safeTransfer(msg.sender, reward);
+    }
+}
+```
+
+### Batch transfer with per-item guard
+
+When iterating over recipients, skip rather than abort on zero amounts:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+contract BatchDistributor {
+    using SafeERC20 for IERC20;
+
+    function distribute(
+        IERC20 token,
+        address[] calldata recipients,
+        uint256[] calldata amounts
+    ) external {
+        require(recipients.length == amounts.length, "length mismatch");
+
+        for (uint256 i = 0; i < recipients.length; i++) {
+            // Skip zero-value transfers to avoid reverting on LEND-style tokens
+            if (amounts[i] == 0) continue;
+            token.safeTransfer(recipients[i], amounts[i]);
+        }
+    }
+}
+```
+
+<Tip>
+Adding an `if (amount == 0) return;` guard at the top of any function that issues transfers is a low-cost habit that prevents unexpected reverts with zero-revert tokens and also saves a small amount of gas by skipping the external call entirely.
+</Tip>
+
+<Note>
+The reverse behavior—tokens that specifically require zero-value transfers to succeed (e.g., for heartbeat or keep-alive patterns)—also exists. When supporting a broad set of tokens, document your protocol's assumptions about zero-value transfer behavior and test against both reverting and non-reverting implementations.
+</Note>
+
+## Related: tokens that revert on transfer to address(0)
+
+A closely related behavior applies to the destination address rather than the amount: some tokens revert if the `dst` argument to `transferFrom` is `address(0)`. OpenZeppelin-based tokens include this guard by default. This breaks protocols that burn tokens by transferring to `address(0)` rather than calling a dedicated `burn` function.
+
+The `RevertToZeroToken` reference implementation shows how this is enforced — a single `require` on the destination address before the underlying transfer logic runs:
+
+```solidity
+// Copyright (C) 2020 d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+import {ERC20} from "./ERC20.sol";
+
+contract RevertToZeroToken is ERC20 {
+    // --- Init ---
+    constructor(uint _totalSupply) ERC20(_totalSupply) public {}
+
+    // --- Token ---
+    function transferFrom(address src, address dst, uint wad) override public returns (bool) {
+        require(dst != address(0), "transfer-to-zero");
+        return super.transferFrom(src, dst, wad);
+    }
+}
+```
+
+**Defensive measure:** Never burn tokens by transferring to `address(0)`. Call a dedicated `burn(amount)` function if the token provides one, or use a protocol-level dead address (e.g., `address(0xdead)`) as an alternative burn destination — after confirming the token does not also block that address.

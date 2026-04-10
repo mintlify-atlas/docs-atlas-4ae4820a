@@ -1,0 +1,124 @@
+---
+title: "Tokens That Silently Deduct a Fee on Every Transfer"
+description: "STA and PAXG take a fee on every transfer. Protocols that credit the input amount without measuring actual receipt can be drained by the discrepancy."
+---
+
+Fee-on-transfer tokens deduct a percentage or flat fee from every transfer, so the amount that arrives at the destination is always less than the amount passed to `transfer` or `transferFrom`. This is a legitimate design choice—some projects use the fee to fund a treasury, burn supply, or reward stakers—but it breaks a common assumption baked into DeFi protocols: that crediting a user for `amount` tokens is safe after calling `transferFrom(user, address(this), amount)`. This page covers how the mechanism works, the $500k Balancer exploit it enabled in 2020, and how to write integrations that measure what actually arrived.
+
+## Real-world examples
+
+| Token | Fee behavior |
+|-------|-------------|
+| STA (Statera) | 1% fee burned on every transfer |
+| PAXG (Paxos Gold) | Small fee taken on every on-chain transfer |
+| USDT (Tether) | Fee mechanism exists in the contract but is currently set to zero |
+| USDC (USD Coin) | Fee mechanism exists in the contract but is currently set to zero |
+
+<Warning>
+In June 2020, an attacker drained approximately $500,000 from several Balancer liquidity pools using STA, a fee-on-transfer token. Balancer's smart pool logic assumed that the amount passed into a swap was the amount actually received. By repeatedly cycling STA through the pool, the attacker exploited the growing discrepancy between the pool's recorded balance and its actual balance, eventually draining WETH, WBTC, LINK, and SNX from the affected pools.
+</Warning>
+
+## Contract implementation
+
+`TransferFeeToken` overrides `transferFrom` to credit the destination with `wad - fee` rather than the full `wad`. The fee is burned by crediting `address(0)`. The token emits two `Transfer` events: one for the net amount received and one for the fee burned.
+
+```solidity
+// Copyright (C) 2020 d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+import {ERC20} from "./ERC20.sol";
+
+contract TransferFeeToken is ERC20 {
+
+    uint immutable fee;
+
+    // --- Init ---
+    constructor(uint _totalSupply, uint _fee) ERC20(_totalSupply) public {
+        fee = _fee;
+    }
+
+    // --- Token ---
+    function transferFrom(address src, address dst, uint wad) override public returns (bool) {
+        require(balanceOf[src] >= wad, "insufficient-balance");
+        if (src != msg.sender && allowance[src][msg.sender] != type(uint).max) {
+            require(allowance[src][msg.sender] >= wad, "insufficient-allowance");
+            allowance[src][msg.sender] = sub(allowance[src][msg.sender], wad);
+        }
+
+        balanceOf[src] = sub(balanceOf[src], wad);
+        balanceOf[dst] = add(balanceOf[dst], sub(wad, fee));
+        balanceOf[address(0)] = add(balanceOf[address(0)], fee);
+
+        emit Transfer(src, dst, sub(wad, fee));
+        emit Transfer(src, address(0), fee);
+
+        return true;
+    }
+}
+```
+
+Key observations:
+- `src` is debited the full `wad`, but `dst` receives only `wad - fee`.
+- The allowance is consumed for the full `wad`, not the net amount.
+- Both USDT and USDC have fee switches in their contracts that are currently disabled; they could be enabled by their respective administrators without a contract upgrade.
+
+## Integration risks
+
+**Over-crediting depositors.** A vault that executes `token.transferFrom(user, address(this), amount)` and then records `deposits[user] += amount` will credit more than it received. A user can later withdraw more tokens than the vault actually holds, draining funds from other depositors.
+
+**Swap amount mismatch.** An AMM that computes output based on the input amount will over-pay if the pool receives less than `amount`. The attacker receives the full output but the pool is short on input.
+
+**Fee-switch risk.** USDT and USDC have dormant fee mechanisms. A protocol tested against the current zero-fee behavior could silently break if the fee is ever activated.
+
+## Defensive measures
+
+### Balance-difference accounting
+
+Measure the actual balance change rather than trusting the `amount` argument:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+contract FeeAwareVault {
+    using SafeERC20 for IERC20;
+
+    mapping(address => uint256) public deposits;
+
+    function deposit(IERC20 token, uint256 amount) external {
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = token.balanceOf(address(this)) - balanceBefore;
+
+        // Credit the user only for what was actually received
+        deposits[msg.sender] += received;
+    }
+
+    function withdraw(IERC20 token, uint256 amount) external {
+        require(deposits[msg.sender] >= amount, "insufficient balance");
+        deposits[msg.sender] -= amount;
+
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransfer(msg.sender, amount);
+        uint256 sent = balanceBefore - token.balanceOf(address(this));
+
+        // If the token takes a fee on outbound transfers, adjust remaining credit
+        if (sent < amount) {
+            deposits[msg.sender] += (amount - sent);
+        }
+    }
+}
+```
+
+<Tip>
+When building AMMs or lending protocols intended to support arbitrary tokens, document explicitly whether fee-on-transfer tokens are in scope. If they are not, add a comment and consider reverting if `received < amount` to prevent silent miscounting.
+</Tip>
+
+<Note>
+The balance-difference pattern adds two `balanceOf` calls per deposit and withdrawal. On chains where external calls are expensive, consider whether the gas overhead is acceptable, or whether restricting the token allowlist to known non-fee tokens is the better trade-off.
+</Note>

@@ -1,0 +1,132 @@
+---
+title: "ERC20 Tokens That Revert on Zero Value Approve Calls"
+description: "Some tokens like BNB revert on approve(spender, 0), directly conflicting with race-protection patterns that require resetting allowances to zero first."
+---
+
+Some ERC20 tokens reject approval calls where the amount is zero, treating `approve(spender, 0)` as an invalid operation. BNB is the most widely known token with this behavior. The restriction is enforced with a simple `require(wad > 0, ...)` guard in the overridden `approve` function. On its own this is a minor inconvenience, but it becomes a serious integration problem when combined with approval race protection: tokens that require resetting to zero before setting a new value cannot be integrated alongside tokens that refuse to accept a zero value approval. The two constraints are mutually exclusive, creating a genuine catch-22 for generic protocol code.
+
+## Affected Tokens
+
+| Token | Network | Notes |
+|-------|---------|-------|
+| BNB (Binance Coin) | Ethereum mainnet | Legacy ERC20 version; BEP-20 on BSC behaves differently |
+
+<Note>
+  This behavior applies to the original Ethereum-mainnet BNB ERC20 contract. The BEP-20 version of BNB on BNB Chain does not carry this restriction.
+</Note>
+
+## Contract Implementation
+
+The guard is a single line added to `approve`. Any call with `wad == 0` reverts immediately, before any allowance state is read or written.
+
+```solidity
+// Copyright (C) 2020 d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+import {ERC20} from "./ERC20.sol";
+
+contract ApprovalWithZeroValueToken is ERC20 {
+    // --- Init ---
+    constructor(uint _totalSupply) ERC20(_totalSupply) public {}
+
+    // --- Token ---
+    function approve(address usr, uint wad) override public returns (bool) {
+        require(wad > 0, "no approval with zero value");
+        return super.approve(usr, wad);
+    }
+}
+```
+
+## The Catch-22 with Race Protection
+
+The standard workaround for approval race protection (as seen in USDT, KNC) is:
+
+1. Call `approve(spender, 0)` to reset the existing allowance.
+2. Call `approve(spender, newAmount)` to set the new value.
+
+This two-step pattern is entirely blocked when a token also carries the zero-value revert guard. The two constraints are directly contradictory:
+
+| Behavior | Required action | Blocked by |
+|----------|----------------|------------|
+| Race protection (USDT-style) | Must call `approve(spender, 0)` first | Zero-value revert (BNB-style) |
+| Zero-value revert (BNB-style) | Must never call `approve(spender, 0)` | Race protection (USDT-style) |
+
+<Warning>
+  No single approval call sequence satisfies both constraints simultaneously. If your protocol must support tokens with both behaviors — race protection and zero-value revert — you cannot share a single generic approval helper across all token types. You must route to token-specific logic.
+</Warning>
+
+A protocol that attempts the two-step pattern against BNB will revert on step 1. A protocol that skips step 1 against USDT will revert on step 2 if any allowance already exists. The only resolution is per-token handling or avoiding the conflicting token combination entirely.
+
+## Integration Risks
+
+**Generic `safeApprove` helpers fail for one class or the other.** A helper that always resets to zero first will fail on BNB. A helper that skips the reset will fail on USDT when an allowance exists. There is no universally correct behavior.
+
+**Allowance revocation is impossible.** Since `approve(spender, 0)` reverts, there is no way to programmatically revoke an allowance for this token from within a smart contract. This is a meaningful trust assumption: once granted, an allowance cannot be cleared through the standard interface.
+
+**Test environments may not reproduce the behavior.** Most mock or test ERC20 tokens do not include this guard, meaning CI passes while the production path fails silently.
+
+## Defensive Measures
+
+The practical approach is to detect which class of token you are dealing with and branch accordingly. If your protocol only ever deals with a known, curated token list, encode per-token behavior explicitly.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IERC20} from "./IERC20.sol";
+
+/// @notice Attempt to set an allowance, handling tokens that revert on zero
+///         and tokens that require a zero-reset before updating.
+/// @dev    This function tries the zero-reset path and falls back if it reverts.
+///         It is NOT safe to use with tokens that have both restrictions simultaneously.
+function compatApprove(
+    IERC20 token,
+    address spender,
+    uint256 amount
+) internal {
+    // Attempt to reset to zero first (required for race-protected tokens like USDT).
+    // If this reverts (e.g. BNB), skip it — the token does not need or allow a zero reset.
+    if (token.allowance(address(this), spender) != 0) {
+        (bool success, ) = address(token).call(
+            abi.encodeWithSelector(token.approve.selector, spender, 0)
+        );
+        // Ignore revert: token may not allow zero-value approvals.
+        // If the reset succeeds, we proceed with the real amount below.
+        (success); // suppress unused variable warning
+    }
+
+    // Set the actual allowance. For zero-revert tokens, skip if amount is zero.
+    if (amount > 0) {
+        require(
+            token.approve(spender, amount),
+            "approve failed"
+        );
+    }
+}
+```
+
+<Tip>
+  For protocols that need to support an arbitrary set of tokens, the safest approach is to maintain an on-chain or off-chain registry of known token behaviors and dispatch to the correct approval path per token address. This is operationally heavier but eliminates the guesswork.
+</Tip>
+
+For controlled environments where you only interact with one or the other type, keep the helpers separate and intentional:
+
+```solidity
+/// For tokens with zero-value revert (e.g. BNB): never call approve(spender, 0).
+/// Simply set the new value directly — there is no safe way to clear the allowance.
+function approveNonZero(IERC20 token, address spender, uint256 amount) internal {
+    require(amount > 0, "use revokeApproval for zero");
+    require(token.approve(spender, amount), "approve failed");
+}
+
+/// For race-protected tokens (e.g. USDT): always reset to zero before re-approving.
+/// Do NOT use this with tokens that revert on zero-value approvals.
+function approveWithReset(IERC20 token, address spender, uint256 amount) internal {
+    if (token.allowance(address(this), spender) != 0) {
+        require(token.approve(spender, 0), "reset failed");
+    }
+    require(token.approve(spender, amount), "approve failed");
+}
+```

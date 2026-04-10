@@ -1,0 +1,95 @@
+---
+title: 'ERC20 Tokens with Fewer Than 18 Decimal Places (Low)'
+description: 'USDC uses 6 decimals and Gemini USD uses 2. Protocols that assume 18 decimals produce precision loss, rounding errors, and division-to-zero bugs.'
+---
+
+The ERC20 standard does not mandate a specific number of decimal places, and some widely deployed tokens use far fewer than the conventional 18. USDC uses 6 decimals, meaning one USDC is represented as `1_000_000` on-chain. Gemini USD (GUSD) uses only 2, so one dollar is `100`. When a protocol performs arithmetic assuming 18-decimal tokens — computing exchange rates, interest accrual, or share prices — these low-decimal tokens introduce precision loss that can silently drain value from users or the protocol itself.
+
+## Real-world examples
+
+| Token | Decimals | One unit on-chain |
+|---|---|---|
+| **Gemini USD (GUSD)** | 2 | `100` |
+| **USDC** | 6 | `1_000_000` |
+| **WBTC** | 8 | `100_000_000` |
+
+## Reference implementation
+
+The `LowDecimalToken` from the weird-erc20 library demonstrates the pattern: a standard ERC20 that overrides `decimals` to `2`, the same configuration used by Gemini USD.
+
+```solidity
+// Copyright (C) 2020 d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+import {ERC20} from "./ERC20.sol";
+
+contract LowDecimalToken is ERC20 {
+    constructor(uint _totalSupply) ERC20(_totalSupply) public {
+        decimals = 2;
+    }
+}
+```
+
+## Integration risks
+
+<Warning>
+Integer division in Solidity truncates toward zero. With low-decimal tokens, the divisor in common formulas can be large relative to the numerator, causing the result to round to zero or lose significant precision.
+</Warning>
+
+**Exchange rate precision loss.** Consider a DEX computing an output amount:
+
+```solidity
+// amount = 1 GUSD = 100 (2 decimals)
+// price  = 1 ETH per GUSD, represented with 18-decimal precision
+uint256 output = (amount * price) / 1e18;
+
+// With amount = 100 and price = 1e18:
+// output = (100 * 1e18) / 1e18 = 100  ✓ — this case is fine
+
+// But if price is stored with 6 decimals of precision
+// and amount = 1 (smallest GUSD unit = $0.01):
+// output = (1 * 1_000_000) / 1e18 = 0  ✗ — rounds to zero
+```
+
+**Interest accrual truncation.** Lending protocols that compute per-second interest on small GUSD positions will frequently round the accrued amount to zero, silently forfeiting interest owed to lenders.
+
+**Share price arithmetic.** Vault share prices computed as `totalAssets / totalShares` will lose precision much faster with 2-decimal tokens than with 18-decimal ones, creating systematic rounding errors that favor either the vault or the depositor depending on the rounding direction.
+
+**Unit assumption mismatches.** Libraries and off-chain tooling often assume 18 decimals when formatting amounts. Passing a raw 2-decimal amount through code written for 18-decimal tokens produces values that are `10^16` times too small.
+
+## Defensive measures
+
+<Tip>
+Normalize token amounts to a common internal precision (e.g., 18 decimals) at the protocol boundary, perform all arithmetic in that normalized space, and convert back only when interacting with the token.
+</Tip>
+
+**Read `decimals()` at integration time.** Never hardcode an assumed decimal count. Always call `token.decimals()` and use the result to scale amounts correctly.
+
+```solidity
+// Normalize any token amount to 18-decimal precision
+function normalize(address token, uint256 amount) internal view returns (uint256) {
+    uint8 d = IERC20Metadata(token).decimals();
+    if (d < 18) {
+        return amount * (10 ** (18 - d));
+    }
+    return amount;
+}
+```
+
+**Use fixed-point libraries.** Libraries such as PRBMath or Solmate's `FixedPointMathLib` are designed to handle scaling correctly and reduce the risk of precision loss in compound calculations.
+
+**Document expected token precision.** If your protocol only supports tokens above a minimum decimal threshold, enforce this in the constructor or in a token registration function and document the restriction clearly.
+
+```solidity
+function addSupportedToken(address token) external onlyOwner {
+    require(
+        IERC20Metadata(token).decimals() >= 6,
+        "token precision too low"
+    );
+    supportedTokens[token] = true;
+}
+```
+
+**Test with the actual decimal count.** Unit tests written with mock tokens that default to 18 decimals will not catch precision bugs that appear only with 2- or 6-decimal tokens. Write dedicated test cases using tokens with the lowest decimal count your protocol intends to support.

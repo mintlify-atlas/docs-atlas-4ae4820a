@@ -1,0 +1,159 @@
+---
+title: "ERC20 Token Integration and Security Review Checklist"
+description: "A systematic checklist for auditors and developers integrating ERC20 tokens, covering transfer behavior, approvals, token properties, and admin risk."
+---
+
+Before integrating any ERC20 token into a smart contract system, you should methodically check each of the following categories. The behaviors documented here are not theoretical — many have been exploited in production systems with significant financial losses. This checklist applies whether you're conducting an audit, writing integration tests, or reviewing a pull request that adds support for a new token.
+
+<Warning>
+No checklist can substitute for running your integration tests against the concrete weird ERC20 token implementations. Use the reference contracts in this library to exercise each edge case in your test suite.
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="Transfer behavior checks" icon="arrows-left-right">
+    **Missing return values**
+    - Does the contract call `transfer` or `transferFrom` and check the return value with a bare `require`?
+    - If so, the contract will revert on tokens like `USDT` and `BNB` that return nothing. Use a safe transfer wrapper that treats a missing return as success.
+    - Does the contract call `transfer` and treat `false` as success? Tether Gold (`ReturnsFalse`) declares a `bool` return but always returns `false` even when the transfer succeeded.
+
+    See [`MissingReturns.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/MissingReturns.sol) and [`ReturnsFalse.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/ReturnsFalse.sol).
+
+    **Fee-on-transfer**
+    - Does the contract assume `balanceOf(recipient)` increases by exactly `amount` after a `transferFrom`?
+    - Tokens like `STA` and `PAXG` take a transfer fee, meaning the recipient receives less than `amount`. Vault-type contracts must use balance-delta checking.
+    - Does the contract credit a user with the input `amount` rather than the received amount? This led to the $500k Balancer pool drain in 2020.
+
+    See [`TransferFee.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/TransferFee.sol).
+
+    **Reentrancy on transfer**
+    - Does the contract follow checks-effects-interactions order for all token transfers?
+    - ERC777 tokens and other callback-on-transfer designs can re-enter the calling contract mid-transfer. Any state updated after a `transferFrom` call is at risk.
+    - Are reentrancy guards applied to all external-facing functions that touch token balances?
+
+    See [`Reentrant.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/Reentrant.sol).
+
+    **Zero-value transfers**
+    - Does the contract ever transfer zero tokens (e.g., during reward distribution when a user has no accrued balance)?
+    - Tokens like `LEND` revert on zero-value transfers, which can permanently break contract flows that depend on transferring zero.
+
+    See [`RevertZero.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/RevertZero.sol).
+
+    **Transfer-less-than-amount**
+    - Does the contract pass `type(uint256).max` as the transfer amount in any code path?
+    - Tokens like `cUSDCv3` treat `amount == type(uint256).max` as "transfer the entire balance", silently transferring less than requested.
+
+    **Transfer to zero address**
+    - Does the contract burn tokens by transferring to `address(0)`?
+    - OpenZeppelin-based tokens revert on transfer to `address(0)`. Use a dedicated `burn` function or check the token interface before burning this way.
+
+    See [`RevertToZero.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/RevertToZero.sol).
+  </Accordion>
+
+  <Accordion title="Approval behavior checks" icon="shield-check">
+    **Approval race conditions**
+    - Does the contract call `approve(spender, newAmount)` when an existing non-zero allowance exists?
+    - Tokens like `USDT` and `KNC` revert unless the current allowance is zero first. The standard two-step mitigation is to set allowance to `0` before setting the new amount. This is also relevant when integrating with user-facing code that re-approves.
+
+    See [`Approval.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/Approval.sol).
+
+    **Zero-address approvals**
+    - Does the contract ever approve `address(0)` as a spender?
+    - OpenZeppelin tokens revert on `approve(address(0), amount)`. Ensure no code path produces a zero-address spender.
+
+    See [`ApprovalToZeroAddress.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/ApprovalToZeroAddress.sol).
+
+    **Zero-value approvals**
+    - Does the contract use `approve(spender, 0)` to revoke allowances?
+    - Tokens like `BNB` revert when approving a zero amount. Contracts that rely on zero-approval for revocation must handle this case.
+
+    See [`ApprovalWithZeroValue.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/ApprovalWithZeroValue.sol).
+
+    **Large value approvals**
+    - Does the contract pass `type(uint256).max` as the approval amount?
+    - Tokens like `UNI` and `COMP` store approvals internally as `uint96` and revert if the approval amount exceeds `uint96` max. Using `type(uint256).max` is unsafe for these tokens.
+
+    See [`Uint96.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/Uint96.sol).
+
+    **Permit / EIP-2612 compatibility**
+    - Does the contract call `permit()` without a fallback if `permit` is not implemented?
+    - Tokens without permit may not revert, causing the permit call to be a no-op. Subsequent `transferFrom` calls will then fail due to insufficient allowance, but the failure may occur in a surprising location.
+    - Does the contract assume standard EIP-2612 signature encoding? DAI, RAI, CHAI, and several others use a non-standard `permit` signature that takes a `bool allowed` parameter and a nonce instead of a deadline.
+
+    See [`DaiPermit.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/DaiPermit.sol).
+  </Accordion>
+
+  <Accordion title="Token property checks" icon="sliders">
+    **Decimal range**
+    - Does the contract assume 18 decimals anywhere (e.g., hard-coded scaling factors, minimum deposit sizes, or price calculations)?
+    - `USDC` uses 6 decimals. Gemini USD uses 2 decimals. `YAM-V2` uses 24 decimals. Any assumption about decimals is a bug for at least one real token.
+    - Does arithmetic on token amounts overflow when `decimals > 18`? Values scaled to `1e24` can cause unexpected overflows.
+
+    See [`LowDecimals.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/LowDecimals.sol) and [`HighDecimals.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/HighDecimals.sol).
+
+    **Metadata encoding**
+    - Does the contract read `name()` or `symbol()` and `abi.decode` the result as `string`?
+    - `MKR` and some other tokens encode metadata as `bytes32` rather than `string`. The ABI decoder will revert when it receives a `bytes32` where it expects a `string`.
+    - Use low-level calls with error recovery when reading metadata from arbitrary tokens.
+
+    See [`Bytes32Metadata.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/Bytes32Metadata.sol).
+
+    **Rebasing and external balance modifications**
+    - Does the contract cache token balances in storage (e.g., Balancer, Uniswap V2 reserves)?
+    - Ampleforth-style rebasing tokens, airdrop mechanisms, and mintable/burnable tokens can modify balances outside of transfers, causing the contract's cached balance to diverge from the actual balance.
+    - Is there a mechanism to sync cached balances after a rebase event?
+
+    **Multiple token addresses**
+    - Does the contract use a single token address as the canonical key for denying access to funds?
+    - Proxied tokens (such as some early stablecoins) can have multiple valid addresses pointing to the same underlying balance. A contract using a single address as a guard (e.g., `isPoolToken[token]`) can be bypassed by calling via a different proxy address.
+
+    See [`Proxied.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/Proxied.sol).
+
+    **`transferFrom` with `src == msg.sender`**
+    - Does the contract call `transferFrom(address(this), dst, amt)` and assume no allowance is required?
+    - Some tokens (e.g., OpenZeppelin, Uniswap V2) always consume allowance in `transferFrom` regardless of whether `src == msg.sender`. Ensure sufficient self-allowance is set, or use `transfer` instead.
+
+    See [`TransferFromSelf.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/TransferFromSelf.sol).
+  </Accordion>
+
+  <Accordion title="Admin risk checks" icon="lock">
+    **Blocklist**
+    - Can transfers to or from the contract address be blocked by the token admin?
+    - Tokens like `USDC` and `USDT` include an admin-controlled blocklist. A token owner (or regulator) can block the contract address, permanently trapping all funds held in it.
+    - Is the protocol's risk documentation clear that USDC/USDT blocklisting is an accepted risk?
+
+    See [`BlockList.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/BlockList.sol).
+
+    **Pausable**
+    - Can the token admin pause all transfers?
+    - `BNB` and `ZIL` support admin-controlled pause. A paused token causes all protocol actions that require transfers (deposits, withdrawals, liquidations) to revert, potentially leaving the protocol in an unusable state.
+
+    See [`Pausable.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/Pausable.sol).
+
+    **Upgradable token logic**
+    - Is the token upgradable (e.g., uses a proxy pattern like `USDC` or `USDT`)?
+    - The token owner can change any aspect of token semantics at any time — including fee logic, transfer restrictions, or even the return values of `balanceOf`. Any invariant the protocol relies on can be broken by an upgrade.
+    - Consider adding an emergency freeze that disables interactions with an upgradable token if an upgrade is detected, similar to the MakerDAO `TUSD` adapter.
+
+    See [`Upgradable.sol`](https://github.com/d-xo/weird-erc20/blob/main/src/Upgradable.sol).
+
+    **Flash mintable tokens**
+    - Does any protocol logic depend on `totalSupply` as a source of truth (e.g., for price calculations or share math)?
+    - Tokens like `DAI` support flash minting, which allows `totalSupply` to reach `type(uint256).max` within a single transaction. Any invariant that depends on total supply being bounded is breakable.
+
+    **Native currency as ERC20**
+    - Is the protocol deployed on Celo, Polygon, or zkSync Era, where the native currency has an ERC-20 address?
+    - Celo's `CELO` token (`0x471EcE3750Da237f93B8E339c536989b8978a438`), Polygon's `POL`, and zkSync's `ETH` all have ERC-20 representations. A protocol that handles both native currency and ERC-20 tokens may double-count or allow double-spend if it does not explicitly exclude the native token's ERC-20 address.
+    - This exact pattern was identified as a critical vulnerability in Uniswap V4 on the Celo network.
+  </Accordion>
+</AccordionGroup>
+
+## External resources
+
+These checklists from security firms cover token integration security in additional depth:
+
+- [Trail of Bits token integration checklist](https://github.com/crytic/building-secure-contracts/blob/master/development-guidelines/token_integration.md) — comprehensive review criteria used by professional auditors
+- [Consensys Diligence token interaction checklist](https://consensys.net/diligence/blog/2020/11/token-interaction-checklist/) — focused on interaction-level risks
+
+<Tip>
+Run your integration tests against every token in the weird-erc20 library, not just the specific behaviors you expect. Unexpected failures against reference tokens often reveal implicit assumptions in your code.
+</Tip>

@@ -1,0 +1,140 @@
+---
+title: "Tokens That Execute Reentrant Callbacks on Transfer"
+description: "ERC777-style tokens invoke a callback mid-transfer. Without reentrancy guards, an attacker can re-enter and drain reserves before balances are settled."
+---
+
+Some token standards, most notably ERC777, allow a token contract to invoke a callback on the recipient or sender during a `transfer` or `transferFrom` call. If the receiving contract has not been written with reentrancy in mind, an attacker can exploit the callback to re-enter a function before the first invocation has finished updating internal state. This page covers how reentrant tokens work, the two high-profile exploits they enabled against Uniswap and dForce, and the patterns that prevent the attack.
+
+## Real-world examples
+
+| Token / Standard | Mechanism |
+|------------------|-----------|
+| ERC777 tokens | `tokensReceived` hook called on every transfer |
+| imBTC | ERC777 implementation; used to drain Uniswap v1 liquidity |
+| Any token with a configurable call target | Arbitrary external call injected mid-transfer |
+
+<Warning>
+Two separate exploits in April–May 2020 used ERC777 reentrancy to drain liquidity pools:
+
+- **imBTC / Uniswap v1** — An attacker drained the entire imBTC/ETH liquidity pool on Uniswap v1 by reentering the pool's `tokenToEthSwapInput` function during the ERC777 `tokensReceived` hook, before the pool updated its reserve balances.
+- **lendf.me / dForce** — A similar reentrancy attack against the dForce lending protocol (lendf.me) drained approximately $25 million in assets. The attacker used imBTC deposits to reenter the protocol's deposit accounting before balances were settled.
+</Warning>
+
+## Contract implementation
+
+`ReentrantToken` extends the base `ERC20` and adds a configurable per-address call target. After completing a standard `transferFrom`, it calls an arbitrary address and calldata that the `src` account registered via `setTarget`. This simulates the ERC777 send-hook pattern.
+
+```solidity
+// Copyright (C) 2020 d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+import {ERC20} from "./ERC20.sol";
+
+contract ReentrantToken is ERC20 {
+    // --- Init ---
+    constructor(uint _totalSupply) ERC20(_totalSupply) public {}
+
+    // --- Call Targets ---
+    mapping (address => Target) public targets;
+    struct Target {
+        bytes   data;
+        address addr;
+    }
+    function setTarget(address addr, bytes calldata data) external {
+        targets[msg.sender] = Target(data, addr);
+    }
+
+    // --- Token ---
+    function transferFrom(address src, address dst, uint wad) override public returns (bool res) {
+        res = super.transferFrom(src, dst, wad);
+        Target memory target = targets[src];
+        if (target.addr != address(0)) {
+            (bool status,) = target.addr.call{gas: gasleft()}(target.data);
+            require(status, "call failed");
+        }
+    }
+}
+```
+
+Key observations:
+- The external call at line 27 fires **after** the token balances are updated but **before** the calling contract has had a chance to update its own accounting.
+- The call forwards all remaining gas, giving the re-entrant callback maximum execution budget.
+- Any address can register a target for itself, meaning this pattern can be exploited by any holder.
+
+## Integration risks
+
+**Stale reserve accounting.** AMMs and lending protocols that read their own internal balance cache (e.g., a `reserves` variable) are vulnerable. If the external call reenters a swap or deposit function, the contract acts on the old cached value, allowing double-accounting of the same funds.
+
+**Cross-function reentrancy.** A reentrancy guard on a single function does not protect other functions in the same contract that share state. An attacker may reenter a different entry point that reads the same storage slot.
+
+**Approval-based attacks.** In `transferFrom` flows, an attacker holding a pre-approved allowance can trigger reentrancy through the sender's registered hook even if the sender is a trusted contract.
+
+## Defensive measures
+
+### Checks-Effects-Interactions
+
+Update all internal state **before** making any external call, including token transfers:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract SafePool {
+    mapping(address => uint256) public deposits;
+
+    function withdraw(address token, uint256 amount) external {
+        // 1. Check
+        require(deposits[msg.sender] >= amount, "insufficient balance");
+
+        // 2. Effect — update state before any external interaction
+        deposits[msg.sender] -= amount;
+
+        // 3. Interact — external call comes last
+        IERC20(token).transfer(msg.sender, amount);
+    }
+}
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+```
+
+### ReentrancyGuard
+
+Pair CEI with OpenZeppelin's `ReentrancyGuard` as a belt-and-suspenders defense:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract GuardedPool is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    mapping(address => uint256) public deposits;
+
+    function deposit(IERC20 token, uint256 amount) external nonReentrant {
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        deposits[msg.sender] += amount;
+    }
+
+    function withdraw(IERC20 token, uint256 amount) external nonReentrant {
+        require(deposits[msg.sender] >= amount, "insufficient balance");
+        deposits[msg.sender] -= amount;
+        token.safeTransfer(msg.sender, amount);
+    }
+}
+```
+
+<Tip>
+Apply `nonReentrant` to every public function that reads or writes shared state, not just the function you believe is the attack surface. Cross-function reentrancy attacks target functions you did not guard.
+</Tip>
+
+<Note>
+Read-only reentrancy is a related pattern where an attacker reenters a `view` function during a state transition to read inconsistent data (e.g., a price oracle). `ReentrancyGuard` does not block this; the CEI pattern and avoiding oracle reads during state transitions are the correct mitigations.
+</Note>

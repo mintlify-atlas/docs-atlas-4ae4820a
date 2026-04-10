@@ -1,0 +1,131 @@
+---
+title: "ERC20 Approval Race Protection and Re-Approval Blocks"
+description: "Some tokens block re-approval when a non-zero allowance exists, guarding against a known ERC20 attack vector but breaking naive approval workflows."
+---
+
+Some ERC20 tokens — most notably USDT and KNC — enforce a rule that an `approve()` call will revert if the caller already has a non-zero allowance set for the given spender. This behavior exists as a mitigation for a well-known ERC20 double-spend attack vector: if a spender frontruns an allowance change from `N` to `M`, they can consume both allowances. The guard forces callers to explicitly reset the allowance to zero before setting a new value, making the sequence of intent unambiguous on-chain. While protective in theory, this behavior is a common source of integration failures when protocol code assumes that a single `approve` call is sufficient to update an existing allowance.
+
+## Affected Tokens
+
+| Token | Network | Notes |
+|-------|---------|-------|
+| USDT (Tether) | Ethereum mainnet | Most widely encountered instance of this behavior |
+| KNC (Kyber Network Crystal) | Ethereum mainnet | Legacy token; newer KNC v2 does not enforce this |
+
+<Note>
+  This behavior is documented in the [ERC20 API attack vector writeup](https://docs.google.com/document/d/1YLPtQxZu1UAvO9cZ1O2RPXBbT0mooh4DYKjA_jp-RLM/edit#heading=h.b32yfk54vyg9) and caused [real breakage in Uniswap v2 periphery contracts](https://github.com/Uniswap/uniswap-v2-periphery/pull/26#issuecomment-647543138).
+</Note>
+
+## Contract Implementation
+
+The reference implementation below shows how this guard is enforced. The overridden `approve` function checks that the current allowance for the spender is zero before proceeding. Any non-zero existing allowance causes the call to revert with `"unsafe-approve"`.
+
+```solidity
+// Copyright (C) 2020 d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+import {ERC20} from "./ERC20.sol";
+
+contract ApprovalRaceToken is ERC20 {
+    // --- Init ---
+    constructor(uint _totalSupply) ERC20(_totalSupply) public {}
+
+    // --- Token ---
+    function approve(address usr, uint wad) override public returns (bool) {
+        require(allowance[msg.sender][usr] == 0, "unsafe-approve");
+        return super.approve(usr, wad);
+    }
+}
+```
+
+## Integration Risks
+
+**Protocols that update allowances in-place will revert.** Any code path that calls `approve(spender, newAmount)` without first resetting the allowance to zero will fail if a previous non-zero allowance exists. This includes:
+
+- Router contracts that top up existing allowances before a swap.
+- Lending protocols that pre-approve a max amount and then attempt to update it.
+- Any integration that calls `approve` more than once per spender per user session without intermediate cleanup.
+
+**Partial consumption does not help.** Even if a spender has consumed some of the allowance but a non-zero residue remains, the next `approve` call will still revert. The residue must be explicitly zeroed first.
+
+<Warning>
+  Never assume that a single `approve(spender, amount)` call will succeed. For tokens with race protection, the call will revert silently (from the perspective of the caller) if any allowance remains. This has historically been confused with a gas estimation failure, masking the root cause.
+</Warning>
+
+## Defensive Measures
+
+The canonical workaround is a two-step approval: first set the allowance to zero, then set it to the desired value. This is safe for all standard ERC20 tokens and required for race-protected ones.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IERC20} from "./IERC20.sol";
+
+/// @notice Safely update an ERC20 allowance, compatible with race-protected tokens.
+/// @param token  The ERC20 token to approve.
+/// @param spender The address being granted approval.
+/// @param amount  The new desired allowance.
+function safeApprove(IERC20 token, address spender, uint256 amount) internal {
+    // Step 1: read current allowance
+    uint256 current = token.allowance(address(this), spender);
+
+    // Step 2: only reset if needed — avoids an extra tx when starting from zero
+    if (current != 0) {
+        token.approve(spender, 0);
+    }
+
+    // Step 3: set the target allowance
+    token.approve(spender, amount);
+}
+```
+
+<Tip>
+  OpenZeppelin's `SafeERC20` library provides `forceApprove` (previously `safeApprove`) that implements this exact pattern. Prefer that over rolling your own implementation to benefit from audited code and library updates.
+</Tip>
+
+For contracts that manage user-facing token approvals, consider surfacing the two-step requirement to the frontend so that users can submit both transactions before interacting with your protocol:
+
+```solidity
+// Pseudo-code for a router that checks before routing
+function routeWithToken(IERC20 token, address spender, uint256 amount) external {
+    uint256 existing = token.allowance(msg.sender, spender);
+    if (existing > 0 && existing != amount) {
+        // Revert early with a useful message rather than letting the inner approve revert
+        revert("Reset allowance to 0 before updating");
+    }
+    token.transferFrom(msg.sender, address(this), amount);
+    // ... routing logic
+}
+```
+
+## Related: transferFrom with src == msg.sender
+
+Different ERC20 implementations disagree on whether `transferFrom(src, dst, amt)` should consume the caller's allowance when `src == msg.sender`. The base `ERC20.sol` in this library skips the allowance check when `src == msg.sender`, giving `transferFrom` the same semantics as `transfer` in that case. Other implementations — including OpenZeppelin and Uniswap V2 — always consume the allowance even when the caller and source are the same address.
+
+The `TransferFromSelfToken` reference implementation always decrements the allowance, even for self-transfers:
+
+```solidity
+// Copyright (C) 2017, 2018, 2019, 2020 dbrock, rain, mrchico, d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+contract TransferFromSelfToken {
+    // ... ERC20 data omitted for brevity ...
+
+    function transferFrom(address src, address dst, uint wad) virtual public returns (bool) {
+        // Always checks and decrements allowance, even when src == msg.sender
+        if (allowance[src][msg.sender] != type(uint).max) {
+            require(allowance[src][msg.sender] >= wad, "insufficient-allowance");
+            allowance[src][msg.sender] = sub(allowance[src][msg.sender], wad);
+        }
+        _transfer(src, dst, wad);
+        return true;
+    }
+}
+```
+
+**Integration risk:** A contract that calls `token.transferFrom(address(this), dst, amt)` to move its own tokens — assuming no allowance is needed because it is the source — will revert on `TransferFromSelfToken` and OpenZeppelin tokens unless it has pre-approved itself. Use `transfer(dst, amt)` when the caller and source are the same address to avoid this ambiguity.

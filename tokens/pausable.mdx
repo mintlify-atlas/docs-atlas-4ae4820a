@@ -1,0 +1,89 @@
+---
+title: 'ERC20 Tokens with Admin-Controlled Pause Functionality'
+description: 'BNB and ZIL expose a pause that halts all transfers globally. Any protocol holding these tokens can be frozen simultaneously by a single admin transaction.'
+---
+
+Some ERC20 tokens grant an admin the ability to pause all token activity with a single transaction. Unlike a blocklist — which targets specific addresses — a pause is a global freeze: every `transfer`, `transferFrom`, and `approve` call reverts for every user until the admin resumes the token. BNB and ZIL are prominent examples that have shipped this capability. This page explains the mechanism, who uses it, the risks it introduces, and how to defend against them.
+
+## Real-world examples
+
+**BNB (Binance Coin)** — the original BEP-2 and early ERC-20 versions of BNB included a `freeze`/`unfreeze` mechanism controllable by the token owner.
+
+**ZIL (Zilliqa)** — the ERC-20 bridge representation of ZIL includes a `pause` function restricted to an admin role, consistent with the pattern shown below.
+
+## Source code
+
+The implementation is straightforward: a single boolean `live` gates all three mutating ERC-20 operations:
+
+```solidity Pausable.sol
+// Copyright (C) 2020 d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+import {ERC20} from "./ERC20.sol";
+
+contract PausableToken is ERC20 {
+    // --- Access Control ---
+    address owner;
+    modifier auth() { require(msg.sender == owner, "unauthorised"); _; }
+
+    // --- Pause ---
+    bool live = true;
+    function stop() auth external { live = false; }
+    function start() auth external { live = true; }
+
+    // --- Init ---
+    constructor(uint _totalSupply) ERC20(_totalSupply) public {
+        owner = msg.sender;
+    }
+
+    // --- Token ---
+    function approve(address usr, uint wad) override public returns (bool) {
+        require(live, "paused");
+        return super.approve(usr, wad);
+    }
+    function transfer(address dst, uint wad) override public returns (bool) {
+        require(live, "paused");
+        return super.transfer(dst, wad);
+    }
+    function transferFrom(address src, address dst, uint wad) override public returns (bool) {
+        require(live, "paused");
+        return super.transferFrom(src, dst, wad);
+    }
+}
+```
+
+<Note>
+  All three mutating functions — `approve`, `transfer`, and `transferFrom` — are gated by the `live` flag. This means even setting allowances is blocked during a pause, preventing users from preparing for an eventual resume.
+</Note>
+
+## Integration risks
+
+<Warning>
+  A pause is a system-wide freeze. Unlike a blocklist, it does not require the admin to know your contract address. Any protocol that touches the token — AMMs, lending markets, bridges, yield aggregators — is frozen simultaneously.
+</Warning>
+
+The systemic nature of a pause creates risks that differ from the blocklist scenario:
+
+**Mass simultaneous failure.** When a token is paused, every protocol holding it is affected at once. Liquidations can't execute, LP positions can't be withdrawn, and debt positions may go under-collateralized while the token is frozen. A malicious pause timed to coincide with a market move could amplify losses across many protocols.
+
+**No on-chain warning.** There is no event emitted before `stop()` is called. Your system goes from fully functional to completely frozen with no intermediate state. If your protocol has no fallback path, users are stuck.
+
+**Collateral damage from an unrelated event.** The pause may be triggered for reasons entirely unrelated to your protocol — a vulnerability in the token contract itself, a regulatory demand, or an operational mistake. Your users bear the cost regardless.
+
+**Approve is also blocked.** Users cannot update allowances while paused. Protocols that require allowance adjustments as part of their exit flow may find users unable to withdraw even after the pause is lifted, if the resume triggers time-sensitive operations requiring fresh approvals.
+
+## Defensive measures
+
+**Monitor pause events.** Subscribe to `Pause` / `Unpause` events (or equivalent) emitted by any token your protocol integrates. Alert immediately when a pause is detected so your team can communicate the situation to users and, if applicable, trigger your own contingency logic.
+
+**Implement a contingency mode.** Similar to the MakerDAO TUSD adapter pattern, consider a permissioned function that freezes new deposits into your protocol when a dependency token is paused. This prevents users from depositing tokens that immediately become stuck, while allowing existing holders to queue for exit once the token resumes.
+
+**Document the dependency clearly.** If your protocol integrates a pausable token, your security documentation and UI should explain this risk. Users should understand that their position may be temporarily frozen by a third party outside your control.
+
+**Prefer tokens without pause mechanisms for critical collateral.** Where your system design allows it, favor tokens without admin pause capabilities for roles like primary collateral or protocol-owned liquidity. Reserve pausable token integration for lower-risk or peripheral uses.
+
+<Tip>
+  The safest approach is to treat a pause as potentially permanent during your threat modeling. If your protocol cannot survive indefinitely with a core token frozen, design an escape hatch — for example, allowing governance to substitute an alternative token or settle positions in a different asset — before deploying.
+</Tip>

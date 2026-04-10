@@ -1,0 +1,53 @@
+---
+title: 'Flash-Mintable Tokens and Transient Supply Inflation'
+description: 'DAI supports flash minting: totalSupply can transiently reach uint256 max in one tx. Protocols using totalSupply for pricing or share math can be manipulated.'
+---
+
+Flash minting is a mechanism that allows tokens to be created out of nothing for the duration of a single transaction and then burned before that transaction ends. If the minted amount is not returned to the token contract by the time the transaction concludes, the whole transaction reverts. Unlike a flash loan — which lends out pre-existing tokens from a pool — flash minting does not require the tokens to exist at the start of the transaction. This means the total supply of a flash-mintable token can transiently reach `type(uint256).max` within a single block. DAI, via the MakerDAO flash mint module, is the most prominent example.
+
+## Real-world examples
+
+**DAI (MakerDAO)** — MakerDAO deployed a dedicated flash mint module that allows any caller to mint up to a governance-set ceiling of DAI, use it within the same transaction, and return it. Full documentation for the module is available in the [MakerDAO developer docs](https://docs.makerdao.com/smart-contract-modules/flash-mint-module).
+
+## Flash minting vs. flash loans
+
+Flash loans borrow tokens from an existing pool. The pool must hold sufficient reserves before the transaction begins, and those reserves define the upper limit of what can be borrowed. Flash minting has no such limit — tokens are created on demand and the only ceiling is the protocol's configured maximum or the arithmetic limits of `uint256`. This distinction matters because it means a flash mint can temporarily produce a supply far in excess of what any flash loan facility could offer.
+
+| | Flash loan | Flash mint |
+|---|---|---|
+| Tokens exist before transaction | Yes | No |
+| Bounded by existing reserves | Yes | No |
+| Max possible amount | Pool balance | Up to `type(uint256).max` |
+| Repaid to | Lending pool | Token contract (burned) |
+
+<Note>
+  From the perspective of your contract receiving tokens mid-transaction, there is no difference between tokens obtained via a flash loan and tokens obtained via a flash mint. The distinction matters when reasoning about total supply and the feasibility of large-amount attacks.
+</Note>
+
+## Integration risks
+
+<Warning>
+  Any system that reads `totalSupply()` within a transaction and uses it for access control, pricing, or share calculations can be manipulated by a flash minter, because `totalSupply()` may temporarily equal `type(uint256).max` during the transaction.
+</Warning>
+
+**Total supply as an oracle.** Some protocols derive prices, exchange rates, or collateral ratios from `totalSupply()`. A flash mint can inflate this value by an astronomical amount within a single transaction, distorting any formula that divides by or compares against total supply.
+
+**Share-based vaults.** Vault contracts that calculate a depositor's share of the pool as `userBalance / totalSupply` are particularly vulnerable. A flash mint that temporarily inflates `totalSupply` will cause share calculations to round toward zero, potentially allowing an attacker to deposit a small amount of tokens and receive a disproportionate share of the vault's assets.
+
+**Governance snapshot attacks.** Governance systems that take an in-transaction snapshot of token supply to determine quorum or voting weight can be manipulated if the snapshot reads `totalSupply()` at a moment when it has been inflated by a flash mint.
+
+**Overflow risks in integrations.** Code that performs arithmetic on `totalSupply()` without overflow protection may revert or silently produce incorrect results when the supply is at `type(uint256).max`. Even with Solidity 0.8's built-in checked arithmetic, a revert is often a denial-of-service attack vector.
+
+## Defensive measures
+
+**Do not use `totalSupply()` for access control within a transaction.** Any check of the form "only allow this if total supply is below X" or "calculate this rate from total supply" is unsafe if the token supports flash minting. Redesign such logic to use externally-verified checkpoints or time-weighted averages instead.
+
+**Use snapshots taken at the start of a transaction or at a prior block.** If your system needs to know the total supply, read it once at the beginning of the transaction and store it in a local variable — do not re-read it after any external call. Better still, use a value from a previous block where no flash mint was in progress.
+
+**Be cautious with any value derived from supply.** This includes price oracles that factor in supply, vault share calculations, and rebase mechanics. Audit every code path that reads `totalSupply()` and assess whether a temporarily inflated value would create an exploitable condition.
+
+**Validate amounts against expected bounds.** If your protocol receives a callback (e.g., a flash mint callback) that involves large token amounts, validate that the amounts are within expected operational ranges before proceeding. Rejecting unexpectedly large amounts at the entry point prevents the flash-minted supply from reaching deeper logic.
+
+<Tip>
+  When auditing a protocol for flash mint vulnerabilities, search for every call to `totalSupply()` and trace its use. The question to ask is: what happens to this calculation if `totalSupply()` returns `type(uint256).max`?
+</Tip>

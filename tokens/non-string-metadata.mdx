@@ -1,0 +1,154 @@
+---
+title: 'Tokens with bytes32-Encoded Name and Symbol Fields'
+description: 'MKR encodes name and symbol as bytes32 instead of string. Calling standard IERC20Metadata getters on these tokens causes ABI-decode failures.'
+---
+
+The ERC20 standard specifies that `name` and `symbol` should be `string` return types, but some early and widely-used tokens declared these fields as `bytes32` instead. The canonical example is MKR (Maker), deployed on Ethereum with `name` and `symbol` as `public bytes32` constants. When a contract or off-chain indexer calls `.name()` expecting a `string`, the ABI decoder receives a 32-byte word where a `string` length-prefixed encoding was expected, producing either a revert or corrupted output. This affects any integration that reads token metadata dynamically — DEX UIs, portfolio trackers, on-chain metadata routers, and token registry contracts.
+
+## Real-world examples
+
+| Token | Address | Metadata type |
+|---|---|---|
+| **MKR** | `0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2` | `bytes32` |
+
+## Reference implementation
+
+The `Bytes32Metadata` contract from the weird-erc20 library reproduces the exact pattern used by MKR: `name` and `symbol` are `bytes32 public constant` fields, not `string`.
+
+```solidity
+// Copyright (C) 2017, 2018, 2019, 2020 dbrock, rain, mrchico, d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+contract Math {
+    function add(uint x, uint y) internal pure returns (uint z) {
+        require((z = x + y) >= x);
+    }
+    function sub(uint x, uint y) internal pure returns (uint z) {
+        require((z = x - y) <= x);
+    }
+}
+
+contract ERC20 is Math {
+    // --- ERC20 Data ---
+    bytes32 public constant name = "Token";
+    bytes32 public constant symbol = "TKN";
+    uint8   public constant decimals = 18;
+    uint256 public totalSupply;
+
+    mapping (address => uint)                      public balanceOf;
+    mapping (address => mapping (address => uint)) public allowance;
+
+    event Approval(address indexed src, address indexed guy, uint wad);
+    event Transfer(address indexed src, address indexed dst, uint wad);
+
+    constructor(uint _totalSupply) public {
+        totalSupply = _totalSupply;
+        balanceOf[msg.sender] = _totalSupply;
+        emit Transfer(address(0), msg.sender, _totalSupply);
+    }
+
+    function transfer(address dst, uint wad) virtual public returns (bool) {
+        return transferFrom(msg.sender, dst, wad);
+    }
+    function transferFrom(address src, address dst, uint wad) virtual public returns (bool) {
+        require(balanceOf[src] >= wad, "insufficient-balance");
+        if (src != msg.sender && allowance[src][msg.sender] != type(uint).max) {
+            require(allowance[src][msg.sender] >= wad, "insufficient-allowance");
+            allowance[src][msg.sender] = sub(allowance[src][msg.sender], wad);
+        }
+        balanceOf[src] = sub(balanceOf[src], wad);
+        balanceOf[dst] = add(balanceOf[dst], wad);
+        emit Transfer(src, dst, wad);
+        return true;
+    }
+    function approve(address usr, uint wad) virtual public returns (bool) {
+        allowance[msg.sender][usr] = wad;
+        emit Approval(msg.sender, usr, wad);
+        return true;
+    }
+}
+```
+
+## Why the ABI encoding differs
+
+A `string` return value is ABI-encoded as a dynamic type: a 32-byte offset pointer, followed by a 32-byte length word, followed by the UTF-8 bytes padded to a 32-byte boundary. A `bytes32` return value is ABI-encoded as a single 32-byte static word. When a caller decodes a `bytes32` response using a `string` ABI definition, the first 32 bytes are interpreted as a length, which will typically be a large nonsensical number, causing the decoder to read far beyond the actual response and either revert or produce garbage.
+
+<Warning>
+Calling `.name()` or `.symbol()` on a `bytes32` metadata token using a standard `IERC20Metadata` interface will revert or return corrupted data in Solidity. Off-chain, `ethers.js` and `web3.js` will throw a decode error unless the call is wrapped in a try/catch.
+</Warning>
+
+## Integration risks
+
+**On-chain metadata routers.** Any contract that calls `IERC20Metadata(token).name()` without guarding against revert will revert itself, potentially blocking other protocol operations that depend on the metadata call succeeding.
+
+**Off-chain indexers and UIs.** Subgraph handlers, portfolio dashboards, and DEX frontends that read token names at index time will encounter decode errors for MKR and similar tokens unless they explicitly handle the `bytes32` case.
+
+**Token registry contracts.** Contracts that store token names on-chain by calling `.name()` will store empty or corrupted data for `bytes32` metadata tokens.
+
+## Defensive measures
+
+<Tip>
+Always wrap metadata calls in a try/catch and fall back to a `bytes32` low-level static call. This pattern safely handles both `string` and `bytes32` metadata tokens in a single code path.
+</Tip>
+
+**Use a safe metadata helper.** The following Solidity pattern handles both `string` and `bytes32` returns:
+
+```solidity
+/// @notice Safely read a token's name, handling both string and bytes32 returns.
+function safeTokenName(address token) internal view returns (string memory) {
+    // First, try the standard string interface
+    try IERC20Metadata(token).name() returns (string memory result) {
+        return result;
+    } catch {
+        // Fall back to a raw staticcall and decode as bytes32
+        (bool success, bytes memory data) = token.staticcall(
+            abi.encodeWithSignature("name()")
+        );
+        if (success && data.length == 32) {
+            // Trim null bytes from the fixed-length bytes32
+            bytes32 raw;
+            assembly { raw := mload(add(data, 32)) }
+            return bytes32ToString(raw);
+        }
+        return "";
+    }
+}
+
+/// @notice Convert a null-terminated bytes32 to a string.
+function bytes32ToString(bytes32 src) internal pure returns (string memory) {
+    uint256 len;
+    while (len < 32 && src[len] != 0) len++;
+    bytes memory result = new bytes(len);
+    for (uint256 i = 0; i < len; i++) {
+        result[i] = src[i];
+    }
+    return string(result);
+}
+```
+
+Apply the same pattern to `symbol()`.
+
+**Off-chain: wrap in try/catch.** In TypeScript with ethers.js:
+
+```typescript
+async function safeTokenName(token: Contract): Promise<string> {
+  try {
+    return await token.name();
+  } catch {
+    // Attempt a raw call and decode as bytes32
+    const raw = await token.provider.call({
+      to: token.address,
+      data: token.interface.getSighash("name"),
+    });
+    if (raw && raw.length === 66) {
+      // 0x + 64 hex chars = 32 bytes
+      return ethers.utils.parseBytes32String(raw);
+    }
+    return "";
+  }
+}
+```
+
+**Do not assume metadata calls are safe.** Treat every external call to `.name()` or `.symbol()` as a potential source of revert and wrap it accordingly. Metadata reads are often overlooked in security reviews because they appear read-only and innocuous.

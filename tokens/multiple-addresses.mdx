@@ -1,0 +1,189 @@
+---
+title: 'ERC20 Tokens Accessible at Multiple Contract Addresses'
+description: 'Proxied tokens expose the same balances at both proxy and implementation addresses. Access controls keyed on one address can be bypassed via the alternate.'
+---
+
+Some token deployments use a proxy pattern in which a `TokenProxy` contract forwards all calls to a `ProxiedToken` backend, appending the original caller's address to the calldata. This means the same token — the same balances, allowances, and total supply — is accessible at two distinct Ethereum addresses: the proxy address and the implementation address. Any protocol that builds a security model around "this address represents this token" is vulnerable: a user or attacker can interact with the backend directly using the implementation address, bypassing checks that only test against the proxy address.
+
+## Real-world examples
+
+| Token pattern | Notes |
+|---|---|
+| **Proxied tokens** | Any token using an upgradable proxy or a delegating frontend exposes its implementation at a separate address |
+
+## Reference implementation
+
+The weird-erc20 library provides two contracts that together implement this pattern. `TokenProxy` appends `msg.sender` to every forwarded call, allowing `ProxiedToken` to identify the original caller without trusting `msg.sender` directly (which would always be the proxy).
+
+```solidity
+// Copyright (C) 2017, 2018, 2019, 2020 dbrock, rain, mrchico, d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+contract ProxiedToken {
+    string  public constant name = "Token";
+    string  public constant symbol = "TKN";
+    uint8   public constant decimals = 18;
+    uint256 public totalSupply;
+
+    mapping (address => uint)                      public balanceOf;
+    mapping (address => mapping (address => uint)) public allowance;
+
+    event Approval(address indexed src, address indexed guy, uint wad);
+    event Transfer(address indexed src, address indexed dst, uint wad);
+
+    function add(uint x, uint y) internal pure returns (uint z) {
+        require((z = x + y) >= x);
+    }
+    function sub(uint x, uint y) internal pure returns (uint z) {
+        require((z = x - y) <= x);
+    }
+
+    constructor(uint _totalSupply) public {
+        admin[msg.sender] = true;
+        totalSupply = _totalSupply;
+        balanceOf[msg.sender] = _totalSupply;
+        emit Transfer(address(0), msg.sender, _totalSupply);
+    }
+
+    mapping(address => bool) public admin;
+    function rely(address usr) external auth { admin[usr] = true; }
+    function deny(address usr) external auth { admin[usr] = false; }
+    modifier auth() { require(admin[msg.sender], "non-admin-call"); _; }
+
+    mapping(address => bool) public delegators;
+    modifier delegated() { require(delegators[msg.sender], "non-delegator-call"); _; }
+    function setDelegator(address delegator, bool status) external auth {
+        delegators[delegator] = status;
+    }
+
+    function transfer(address dst, uint wad) delegated external returns (bool) {
+        return _transferFrom(_getCaller(), _getCaller(), dst, wad);
+    }
+    function transferFrom(address src, address dst, uint wad) delegated external returns (bool) {
+        return _transferFrom(_getCaller(), src, dst, wad);
+    }
+    function approve(address usr, uint wad) delegated external returns (bool) {
+        return _approve(_getCaller(), usr, wad);
+    }
+
+    function _transferFrom(
+        address caller, address src, address dst, uint wad
+    ) internal returns (bool) {
+        require(balanceOf[src] >= wad, "insufficient-balance");
+        if (src != caller && allowance[src][caller] != type(uint).max) {
+            require(allowance[src][caller] >= wad, "insufficient-allowance");
+            allowance[src][caller] = sub(allowance[src][caller], wad);
+        }
+        balanceOf[src] = sub(balanceOf[src], wad);
+        balanceOf[dst] = add(balanceOf[dst], wad);
+        emit Transfer(src, dst, wad);
+        return true;
+    }
+    function _approve(address caller, address usr, uint wad) internal returns (bool) {
+        allowance[caller][usr] = wad;
+        emit Approval(caller, usr, wad);
+        return true;
+    }
+    // Reads the original caller address appended to calldata by TokenProxy
+    function _getCaller() internal pure returns (address result) {
+        bytes memory array = msg.data;
+        uint256 index = msg.data.length;
+        assembly {
+            result := and(mload(add(array, index)), 0xffffffffffffffffffffffffffffffffffffffff)
+        }
+        return result;
+    }
+}
+
+contract TokenProxy {
+    address payable immutable public impl;
+    constructor(address _impl) public {
+        impl = payable(_impl);
+    }
+
+    receive() external payable { revert("don't send me ETH!"); }
+
+    fallback() external payable {
+        address _impl = impl;
+        assembly {
+            let ptr := mload(0x40)
+            calldatacopy(ptr, 0, calldatasize())
+            // Append msg.sender to the forwarded calldata
+            mstore(add(ptr, calldatasize()), caller())
+            let result := call(gas(), _impl, callvalue(), ptr, add(calldatasize(), 32), 0, 0)
+            let size := returndatasize()
+            returndatacopy(ptr, 0, size)
+            switch result
+            case 0 { revert(ptr, size) }
+            default { return(ptr, size) }
+        }
+    }
+}
+```
+
+## The rescueFunds vulnerability
+
+The readme for weird-erc20 illustrates a concrete exploit enabled by multiple token addresses. Consider a pool contract with a `rescueFunds` function intended to let the owner recover tokens that were accidentally sent to the pool — but not pool tokens themselves:
+
+```solidity
+mapping(address => bool) isPoolToken;
+
+constructor(address tokenA, address tokenB) public {
+    isPoolToken[tokenA] = true;
+    isPoolToken[tokenB] = true;
+}
+
+function rescueFunds(address token, uint amount) external nonReentrant onlyOwner {
+    require(!isPoolToken[token], "access denied");
+    token.transfer(msg.sender, amount);
+}
+```
+
+If `tokenA` is a proxied token, the pool was initialized with the proxy address. But `ProxiedToken` (the backend) is a separate address that `isPoolToken` never tracks. An owner — or an attacker who has compromised the owner key — can call `rescueFunds(proxyImplAddress, poolBalance)`. The `require` check passes because `isPoolToken[proxyImplAddress]` is `false`, even though the backend holds the same balances as the proxy. The result is all pool funds drained.
+
+<Warning>
+Any access control list, token allowlist, or pool token registry keyed on a single address will be bypassed if the same token is reachable at a second address. This applies to both the proxy → implementation direction and the inverse, where older proxy versions may still be live.
+</Warning>
+
+## Integration risks
+
+**Allowlist bypass.** A protocol that allowlists `proxyAddress` but not `implAddress` can be exploited by anyone interacting with the implementation directly, bypassing any per-address restrictions.
+
+**Double accounting.** A vault that tracks deposits per token address will record deposits through the proxy and the implementation as separate tokens, enabling double-spend of the underlying balance.
+
+**Approval confusion.** Allowances set on the proxy are stored against the proxy address as the spender. If the implementation is called directly, those allowances are not visible, and vice versa.
+
+**Stale proxy versions.** Upgradable tokens may leave old proxy versions live at their original addresses after an upgrade. Funds or approvals made against the old address may be inaccessible through the new one.
+
+## Defensive measures
+
+<Tip>
+Use a curated token registry that maps all known addresses for a given token to a single canonical identifier, rather than using the token address itself as the canonical key.
+</Tip>
+
+**Normalize to canonical address.** Maintain an on-chain or off-chain mapping from all known token addresses (proxy, implementation, legacy versions) to a single canonical token ID. Use the canonical ID as the key in all accounting, allowlists, and pool registries.
+
+```solidity
+mapping(address => bytes32) public canonicalId;
+
+function registerToken(address[] calldata addresses, bytes32 id) external onlyOwner {
+    for (uint256 i = 0; i < addresses.length; i++) {
+        canonicalId[addresses[i]] = id;
+    }
+}
+
+function isPoolToken(address token) internal view returns (bool) {
+    bytes32 id = canonicalId[token];
+    return id != bytes32(0) && poolTokenIds[id];
+}
+```
+
+**Use a token registry.** Rather than relying on address equality, integrate with an established token registry (such as a chain-specific token list) that has already resolved canonical addresses for known tokens.
+
+**Test with implementation address directly.** When auditing or testing a protocol that handles proxied tokens, explicitly test interactions through both the proxy address and the implementation address to verify that security checks are not bypassed.
+
+<Note>
+The `delegated` modifier on `ProxiedToken` requires that `msg.sender` be a registered delegator, which prevents arbitrary callers from using the implementation directly in this specific contract. However, not all proxied token implementations include such a guard, and the security implications of multiple addresses remain even when some paths are restricted.
+</Note>

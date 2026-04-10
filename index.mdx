@@ -1,97 +1,45 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Weird ERC20: Non-Standard Token Behaviors Reference"
+description: "A reference library of Solidity implementations documenting non-standard ERC20 behaviors that have caused real-world exploits and integration failures."
 ---
 
-## Setting up
+Weird ERC20 is a curated collection of minimal Solidity implementations that demonstrate non-standard, dangerous, or surprising ERC20 token behaviors. Every token in this library is based on a real token deployed in the wild — many of which have been exploited to drain millions of dollars from DeFi protocols.
 
-Get your documentation site up and running in minutes.
+Smart contract developers and security auditors can use this library as a testing resource to validate their systems handle edge cases correctly, and as a reference when reviewing token integration code.
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Understand why ERC20 behavior is inconsistent and how to build defensively
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install the library and use the reference implementations in your tests
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Transfer Behaviors" icon="arrows-left-right" href="/tokens/missing-returns">
+    Reentrancy, missing returns, fee-on-transfer, and other transfer quirks
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Approval Behaviors" icon="shield-check" href="/tokens/approval-race-protection">
+    Race conditions, zero-value reverts, non-EIP2612 permit implementations
   </Card>
-</Columns>
+  <Card title="Token Properties" icon="sliders" href="/tokens/balance-modifications">
+    Decimals extremes, rebasing balances, bytes32 metadata, multi-address tokens
+  </Card>
+  <Card title="Admin Controls" icon="lock" href="/tokens/blocklist">
+    Blocklists, pausable tokens, upgradable proxies, and flash minting
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## Why this exists
 
-Everything you need to create world-class documentation.
+The ERC20 "specification" is loosely defined and amounts to little more than an interface declaration. Even the few semantic requirements that exist are routinely violated by token developers. This creates serious challenges for smart contract developers who must interact with arbitrary ERC20 tokens.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="Integration Checklist" icon="list-check" href="/guidance/integration-checklist">
+    A systematic checklist for safely integrating any ERC20 token
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Safe Integration Patterns" icon="code-branch" href="/guidance/safe-patterns">
+    Defensive coding patterns for handling ERC20 edge cases
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Known Exploits" icon="triangle-exclamation" href="/guidance/known-exploits">
+    Real-world exploits caused by unexpected ERC20 token behaviors
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
-
-## Need inspiration?
-
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+</CardGroup>

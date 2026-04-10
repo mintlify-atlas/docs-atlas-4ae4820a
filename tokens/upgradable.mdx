@@ -1,0 +1,118 @@
+---
+title: 'Upgradable ERC20 Tokens Deployed Behind Proxy Contracts'
+description: 'USDC and USDT use upgradable proxies. The token owner can change transfer semantics, fees, or blocklist logic at any time, breaking downstream integrations.'
+---
+
+Some of the most widely used ERC20 tokens — USDC and USDT among them — are not fixed contracts. They are deployed behind proxy contracts that delegate execution to a separate implementation contract. The token owner can replace that implementation at any time, changing the semantics of every function, including `transfer`, `approve`, and `balanceOf`. Any protocol that has hard-coded assumptions about these tokens' behavior is exposed to silent, unannounced changes. This page covers how the proxy pattern works, the specific risks it creates, and the approaches you can use to detect and respond to upgrades.
+
+## Real-world examples
+
+**USDC (Circle)** is deployed as a `FiatTokenProxy` backed by a `FiatTokenV*` implementation. Circle has upgraded the implementation multiple times, adding features such as EIP-3009 (gasless transfers), EIP-2612 permit support, and updated blocklist logic. Each upgrade changed live token behavior.
+
+**USDT (Tether)** is deployed via a similar proxy and has been upgraded to change fee logic and add new capabilities over its lifetime.
+
+## How the proxy pattern works
+
+The proxy contract stores two pieces of state in fixed storage slots defined by EIP-1967: the address of the admin who can authorize upgrades (`ADMIN_KEY`) and the address of the current implementation contract (`IMPLEMENTATION_KEY`). Every call that isn't handled by the proxy itself is forwarded to the implementation via `delegatecall`, which means the implementation runs in the context of the proxy's storage. A new implementation can read and write all of the proxy's existing storage, including balances and allowances.
+
+```solidity Upgradable.sol
+// Copyright (C) 2020 d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+import {ERC20} from "./ERC20.sol";
+
+contract Proxy {
+    bytes32 constant ADMIN_KEY = bytes32(uint256(keccak256('eip1967.proxy.admin')) - 1);
+    bytes32 constant IMPLEMENTATION_KEY = bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1);
+
+    // --- init ---
+
+    constructor(uint totalSupply) public {
+
+        // Manual give()
+        bytes32 slot = ADMIN_KEY;
+        address usr = msg.sender;
+        assembly { sstore(slot, usr) }
+
+        upgrade(address(new ERC20(totalSupply)));
+
+    }
+
+    // --- auth ---
+
+    modifier auth() { require(msg.sender == owner(), "unauthorised"); _; }
+
+    function owner() public view returns (address usr) {
+        bytes32 slot = ADMIN_KEY;
+        assembly { usr := sload(slot) }
+    }
+
+    function give(address usr) public auth {
+        bytes32 slot = ADMIN_KEY;
+        assembly { sstore(slot, usr) }
+    }
+
+    // --- upgrade ---
+
+    function implementation() public view returns (address impl) {
+        bytes32 slot = IMPLEMENTATION_KEY;
+        assembly { impl := sload(slot) }
+    }
+
+    function upgrade(address impl) public auth {
+        bytes32 slot = IMPLEMENTATION_KEY;
+        assembly { sstore(slot, impl) }
+    }
+
+    // --- proxy ---
+
+    fallback() external payable {
+        address impl = implementation();
+        (bool success, bytes memory returndata) = impl.delegatecall{gas: gasleft()}(msg.data);
+        require(success);
+        assembly { return(add(returndata, 0x20), mload(returndata)) }
+    }
+
+    receive() external payable { revert("don't send me ETH!"); }
+}
+```
+
+<Note>
+  The EIP-1967 storage slots (`ADMIN_KEY` and `IMPLEMENTATION_KEY`) are chosen to be very unlikely to collide with normal contract storage, since they are derived by hashing a known string and subtracting 1. You can read the current implementation address from any EIP-1967 proxy by loading the slot `bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1)`.
+</Note>
+
+## Integration risks
+
+<Warning>
+  An upgrade can change any token behavior without notice and without emitting a standard event your protocol is listening for. All assumptions your contract has made about the token — including transfer semantics, fee logic, blocklist behavior, and return values — can be invalidated in a single transaction.
+</Warning>
+
+**Silent semantic changes.** There is no on-chain guarantee that the new implementation preserves the behavior of the old one. The token owner could introduce a transfer fee, change return value conventions, add a blocklist, or alter the `decimals` value. Your contracts have no recourse.
+
+**Storage layout collisions.** If the new implementation uses a different storage layout than the old one, existing state — balances, allowances, admin roles — can be corrupted or misread. A poorly executed upgrade can silently break `balanceOf` without reverting.
+
+**Multiple addresses for the same token.** A proxied token inherently has two addresses: the proxy address (which most integrators use) and the implementation address. Systems that map addresses to token identities — for example, to prevent duplicate collateral types — can be confused. Two contracts pointing to different implementation addresses can represent the same underlying token.
+
+**Loss of upgrade key.** If the admin key is lost or compromised, the token may become permanently non-upgradable or, worse, upgradable by an attacker. Either outcome can break your integration in ways that are difficult to recover from.
+
+## MakerDAO TUSD adapter pattern
+
+MakerDAO addressed the upgradable token risk in their TUSD collateral adapter by introducing a detection-and-freeze mechanism. The adapter tracks the implementation address of the TUSD proxy at the time it was deployed. On each interaction, it checks whether `implementation()` has changed. If it has, the adapter's `live` flag is set to false, halting new deposits. Existing holders can still exit. This pattern gives integrators a safe fallback without requiring the token owner to notify anyone.
+
+The relevant code is in the MakerDAO [dss-deploy repository](https://github.com/makerdao/dss-deploy/blob/7394f6555daf5747686a1b29b2f46c6b2c64b061/src/join.sol#L321).
+
+## Defensive measures
+
+**Cache and monitor the implementation address.** Store the value of `implementation()` when you deploy your integration. On each interaction (or via an off-chain monitoring job), compare the current value to the cached one. If they differ, an upgrade has occurred.
+
+**Freeze on upgrade detection.** Following the MakerDAO pattern, halt new deposits when an upgrade is detected. Allow existing users to withdraw, but do not accept new funds until your team has reviewed the new implementation and confirmed it is safe.
+
+**Do not cache token properties.** Avoid storing `decimals`, transfer return value conventions, or fee status in your own contract at deploy time if those properties could change after an upgrade. Re-read them on each interaction, or accept that a future upgrade could invalidate your cache.
+
+**Use a wrapper contract at the system boundary.** Isolate all direct interaction with the upgradable token inside a single adapter contract. This limits the surface area that needs to be updated or replaced if an upgrade breaks compatibility.
+
+<Tip>
+  You can read the current implementation of any EIP-1967 proxy off-chain with `eth_getStorageAt(proxyAddress, "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc")`. Set up an alert on this slot to be notified of any upgrade before your on-chain code encounters it.
+</Tip>

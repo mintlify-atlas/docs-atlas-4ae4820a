@@ -1,0 +1,102 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Weird ERC20",
+  "projectDescription": "A reference library of minimal Solidity implementations documenting non-standard and dangerous ERC20 token behaviors, intended for smart contract developers and security auditors.",
+  "theme": "aspen",
+  "primaryColor": "#141414",
+  "lightColor": "#c2fa14",
+  "darkColor": "#5c7c14",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Transfer Behaviors",
+            "pages": [
+              "tokens/missing-returns",
+              "tokens/reentrant-calls",
+              "tokens/fee-on-transfer",
+              "tokens/transfer-less-than-amount",
+              "tokens/no-revert-on-failure",
+              "tokens/revert-zero-value-transfers"
+            ]
+          },
+          {
+            "group": "Approval Behaviors",
+            "pages": [
+              "tokens/approval-race-protection",
+              "tokens/revert-approval-zero-address",
+              "tokens/revert-zero-value-approvals",
+              "tokens/revert-large-approvals",
+              "tokens/unusual-permit"
+            ]
+          },
+          {
+            "group": "Token Properties",
+            "pages": [
+              "tokens/balance-modifications",
+              "tokens/low-decimals",
+              "tokens/high-decimals",
+              "tokens/non-string-metadata",
+              "tokens/multiple-addresses"
+            ]
+          },
+          {
+            "group": "Admin Controls & Upgrades",
+            "pages": [
+              "tokens/blocklist",
+              "tokens/pausable",
+              "tokens/upgradable",
+              "tokens/flash-mintable"
+            ]
+          },
+          {
+            "group": "Security Guidance",
+            "pages": [
+              "guidance/integration-checklist",
+              "guidance/safe-patterns",
+              "guidance/known-exploits"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "21+ minimal Solidity reference implementations of non-standard ERC20 token behaviors",
+    "Based on real-world tokens (USDT, BNB, USDC, DAI, UNI, COMP, MKR, etc.)",
+    "Covers transfer quirks: missing return values, fee-on-transfer, reentrancy, and more",
+    "Covers approval quirks: race protections, zero-value reverts, large-value reverts",
+    "Covers admin risks: blocklists, pausable tokens, upgradable proxies",
+    "Documents historical DeFi exploits caused by these behaviors",
+    "Licensed under AGPL-3.0 and published to npm for easy integration"
+  ],
+  "publicApiSurface": [
+    "ERC20.sol — Base ERC20 implementation (transfer, transferFrom, approve)",
+    "Reentrant.sol — ReentrantToken: calls arbitrary targets on transferFrom",
+    "MissingReturns.sol — Token without bool return values on ERC20 methods",
+    "ReturnsFalse.sol — Token that returns false even on successful operations",
+    "TransferFee.sol — TransferFeeToken: deducts fee on every transfer",
+    "BlockList.sol — BlockableToken: admin-controlled address blocklist",
+    "Pausable.sol — PausableToken: admin can pause all transfers",
+    "Upgradable.sol — Proxy: EIP-1967 upgradable proxy token",
+    "Uint96.sol — Token that reverts on values exceeding uint96",
+    "Approval.sol — Token with approval race condition protection",
+    "ApprovalToZeroAddress.sol — Token that reverts on approve(address(0), amt)",
+    "ApprovalWithZeroValue.sol — Token that reverts on approve(address, 0)",
+    "RevertZero.sol — Token that reverts on zero-value transfers",
+    "RevertToZero.sol — Token that reverts on transfer to address(0)",
+    "NoRevert.sol — Token that returns false instead of reverting on failure",
+    "LowDecimals.sol — Token with 2 decimal places",
+    "HighDecimals.sol — Token with 24 decimal places",
+    "Bytes32Metadata.sol — Token with bytes32 name/symbol instead of string",
+    "Proxied.sol — Token accessible via multiple proxy addresses",
+    "TransferFromSelf.sol — Token that always deducts allowance in transferFrom",
+    "DaiPermit.sol — Token with DAI-style permit (non-EIP2612 compliant)"
+  ]
+}

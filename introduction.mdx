@@ -1,0 +1,62 @@
+---
+title: "Weird ERC20: Understanding Non-Standard Token Behaviors"
+description: "Learn why the loose ERC20 specification leads to unpredictable token behavior in production, and how to build smart contracts that handle it defensively."
+---
+
+The Weird ERC20 library is a curated set of minimal Solidity implementations documenting non-standard ERC20 token behaviors observed in real deployed tokens. This page explains why the ERC20 standard produces such inconsistency, what categories of surprising behavior exist, and the defensive patterns you should apply when integrating with arbitrary ERC20 tokens.
+
+## The ERC20 specification problem
+
+The ERC20 "specification" is so loosely defined that it amounts to little more than an interface declaration. Even the few semantic requirements that are imposed — such as returning a `bool` from `transfer` and `transferFrom`, or emitting `Transfer` events — are routinely violated by token developers in the wild.
+
+This loose standard means that every token effectively defines its own behavior. A contract that correctly integrates with one token may silently break with another. Real tokens like `USDT`, `BNB`, `USDC`, and `OMG` each deviate from the expected ERC20 semantics in different ways, and many of those deviations have been used to drain DeFi protocols of millions of dollars.
+
+<Warning>
+  The behaviors documented in this library are based on real tokens that have caused real exploits. Assume that any ERC20 token you integrate with may exhibit one or more of these behaviors unless you have explicitly verified otherwise.
+</Warning>
+
+## Token behavior categories
+
+The library organizes non-standard behaviors into four groups. Each group covers a distinct failure surface in token integrations.
+
+<CardGroup cols={2}>
+  <Card title="Transfer behaviors" icon="arrows-left-right" href="/tokens/missing-returns">
+    Missing return values, fee-on-transfer, reentrancy on transfer, no-revert-on-failure, and transfers of less than the requested amount.
+  </Card>
+  <Card title="Approval behaviors" icon="shield-check" href="/tokens/approval-race-protection">
+    Approval race protections, reverts on zero-value approvals, reverts on approval to the zero address, and non-standard permit implementations.
+  </Card>
+  <Card title="Token properties" icon="sliders" href="/tokens/balance-modifications">
+    Rebasing balances, extreme decimal counts, bytes32-encoded metadata, and tokens accessible via multiple proxy addresses.
+  </Card>
+  <Card title="Admin controls & upgrades" icon="lock" href="/tokens/blocklist">
+    Address blocklists, admin-controlled pause functionality, upgradable token proxies, and flash-mintable supply.
+  </Card>
+</CardGroup>
+
+## Recommended defensive patterns
+
+Because the ERC20 specification cannot be relied upon, the library authors recommend that smart contract developers default to two architectural patterns when integration with external tokens is required.
+
+### 1. Contract-level allowlist of known good tokens
+
+Restrict your system to a set of tokens you have explicitly vetted. For each token on the allowlist, verify which non-standard behaviors it exhibits and ensure your integration handles them correctly.
+
+When an on-chain allowlist is not feasible — for example, in a permissionless AMM where a governance system would be required to add tokens — consider maintaining an off-chain allowlist in your official UI. This protects less sophisticated users from tokens that violate your contract's expectations without sacrificing contract-level permissionlessness.
+
+### 2. Dedicated wrapper contracts at the system edge
+
+Direct token interaction should happen in thin wrapper contracts that sit at the boundary of your system, not inside core logic. The wrapper absorbs all the unpredictable behavior of the external token and presents a consistent, known-good interface to the rest of the system.
+
+This pattern is used by MakerDAO's `join` adapters, which isolate each token's quirks and let the core `vat` contract operate on a uniform internal accounting model. If an upgrade changes a token's semantics, only the adapter needs to change — or can be frozen.
+
+## External resources
+
+<CardGroup cols={2}>
+  <Card title="Trail of Bits token integration checklist" icon="list-check" href="https://github.com/crytic/building-secure-contracts/blob/master/development-guidelines/token_integration.md">
+    A systematic checklist from Trail of Bits covering the properties to verify before integrating any ERC20 token.
+  </Card>
+  <Card title="Consensys Diligence token interaction checklist" icon="list-check" href="https://consensys.net/diligence/blog/2020/11/token-interaction-checklist/">
+    A practical checklist from Consensys Diligence for auditing token interaction code in smart contracts.
+  </Card>
+</CardGroup>

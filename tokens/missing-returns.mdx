@@ -1,0 +1,176 @@
+---
+title: "Tokens Without ERC20 Boolean Return Values on Transfer"
+description: "USDT, BNB, and OMG omit the bool return on transfer. Contracts that decode the return value will revert or silently accept false as a successful transfer."
+---
+
+Some ERC20 tokens deviate from the standard by omitting the `bool` return value from `transfer`, `transferFrom`, and `approve`. The ERC20 specification requires these functions to return `true` on success, but several widely-used tokens—including USDT, BNB, and OMG—simply return nothing. A further variant, exemplified by Tether Gold, does declare a `bool` return but always returns `false` even when the transfer succeeds. This page covers both patterns, the on-chain incident each caused, and how to write integrations that handle them correctly.
+
+## Real-world examples
+
+| Token | Behavior |
+|-------|----------|
+| USDT (Tether) | No return value on `transfer` and `transferFrom` |
+| BNB (Binance Coin) | Returns `bool` on some methods but not others |
+| OMG (OmiseGO) | No return value on ERC20 methods |
+| Tether Gold (XAUT) | Declares `bool` return but always returns `false` |
+
+<Warning>
+BNB's inconsistent return values caused BNB tokens to become permanently stuck in the Uniswap v1 contract. Uniswap v1 called `transfer` and attempted to decode the missing return value, causing the transaction to revert. The tokens were frozen with no recovery path.
+</Warning>
+
+## Contract implementations
+
+### MissingReturns.sol — no return value on any ERC20 operation
+
+```solidity
+// Copyright (C) 2017, 2018, 2019, 2020 dbrock, rain, mrchico, d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+contract MissingReturnToken {
+    // --- ERC20 Data ---
+    string  public constant name = "Token";
+    string  public constant symbol = "TKN";
+    uint8   public constant decimals = 18;
+    uint256 public totalSupply;
+
+    mapping (address => uint)                      public balanceOf;
+    mapping (address => mapping (address => uint)) public allowance;
+
+    event Approval(address indexed src, address indexed guy, uint wad);
+    event Transfer(address indexed src, address indexed dst, uint wad);
+
+    // --- Math ---
+    function add(uint x, uint y) internal pure returns (uint z) {
+        require((z = x + y) >= x);
+    }
+    function sub(uint x, uint y) internal pure returns (uint z) {
+        require((z = x - y) <= x);
+    }
+
+    // --- Init ---
+    constructor(uint _totalSupply) public {
+        totalSupply = _totalSupply;
+        balanceOf[msg.sender] = _totalSupply;
+        emit Transfer(address(0), msg.sender, _totalSupply);
+    }
+
+    // --- Token ---
+    function transfer(address dst, uint wad) external {
+        transferFrom(msg.sender, dst, wad);
+    }
+    function transferFrom(address src, address dst, uint wad) public {
+        require(balanceOf[src] >= wad, "insufficient-balance");
+        if (src != msg.sender && allowance[src][msg.sender] != type(uint).max) {
+            require(allowance[src][msg.sender] >= wad, "insufficient-allowance");
+            allowance[src][msg.sender] = sub(allowance[src][msg.sender], wad);
+        }
+        balanceOf[src] = sub(balanceOf[src], wad);
+        balanceOf[dst] = add(balanceOf[dst], wad);
+        emit Transfer(src, dst, wad);
+    }
+    function approve(address usr, uint wad) external {
+        allowance[msg.sender][usr] = wad;
+        emit Approval(msg.sender, usr, wad);
+    }
+}
+```
+
+### ReturnsFalse.sol — declares bool return but always returns false
+
+```solidity
+// Copyright (C) 2017, 2018, 2019, 2020 dbrock, rain, mrchico, d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+contract ReturnsFalseToken {
+    // --- ERC20 Data ---
+    string  public constant name = "Token";
+    string  public constant symbol = "TKN";
+    uint8   public constant decimals = 18;
+    uint256 public totalSupply;
+
+    mapping (address => uint)                      public balanceOf;
+    mapping (address => mapping (address => uint)) public allowance;
+
+    event Approval(address indexed src, address indexed guy, uint wad);
+    event Transfer(address indexed src, address indexed dst, uint wad);
+
+    // --- Math ---
+    function add(uint x, uint y) internal pure returns (uint z) {
+        require((z = x + y) >= x);
+    }
+    function sub(uint x, uint y) internal pure returns (uint z) {
+        require((z = x - y) <= x);
+    }
+
+    // --- Init ---
+    constructor(uint _totalSupply) public {
+        totalSupply = _totalSupply;
+        balanceOf[msg.sender] = _totalSupply;
+        emit Transfer(address(0), msg.sender, _totalSupply);
+    }
+
+    // --- Token ---
+    function transfer(address dst, uint wad) external returns (bool) {
+        return transferFrom(msg.sender, dst, wad);
+    }
+    function transferFrom(address src, address dst, uint wad) public returns (bool) {
+        require(balanceOf[src] >= wad, "insufficient-balance");
+        if (src != msg.sender && allowance[src][msg.sender] != type(uint).max) {
+            require(allowance[src][msg.sender] >= wad, "insufficient-allowance");
+            allowance[src][msg.sender] = sub(allowance[src][msg.sender], wad);
+        }
+        balanceOf[src] = sub(balanceOf[src], wad);
+        balanceOf[dst] = add(balanceOf[dst], wad);
+        emit Transfer(src, dst, wad);
+        return false;
+    }
+    function approve(address usr, uint wad) external returns (bool) {
+        allowance[msg.sender][usr] = wad;
+        emit Approval(msg.sender, usr, wad);
+        return false;
+    }
+}
+```
+
+## Integration risks
+
+**ABI decoding revert.** When Solidity calls a function declared to return `bool` and the callee returns no data, the ABI decoder reverts. A contract compiled against the standard ERC20 interface will fail every time it interacts with a `MissingReturnToken`.
+
+**Silent false positive.** A contract that checks `require(token.transfer(...))` will revert on `ReturnsFalseToken` even though the state change succeeded. Conversely, if the check is omitted, a genuine failure from a well-behaved token goes undetected.
+
+**Inconsistent per-method behavior.** BNB omits the return value only on certain methods. Generic assumptions ("this token always returns a bool") break down when one method complies and another does not.
+
+## Defensive measures
+
+Use a `safeTransfer` wrapper that handles both the no-return-data case and the `false`-return case. OpenZeppelin's `SafeERC20` library is the canonical implementation:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract SafeTransferExample {
+    using SafeERC20 for IERC20;
+
+    function deposit(IERC20 token, uint256 amount) external {
+        // safeTransferFrom handles missing returns and false returns
+        token.safeTransferFrom(msg.sender, address(this), amount);
+    }
+}
+```
+
+The `safeTransferFrom` implementation uses a low-level call and then checks: if data was returned, decode it and require it is `true`; if no data was returned, treat the call as successful (covering the missing-returns case).
+
+<Note>
+Even with `SafeERC20`, the `ReturnsFalse` pattern (Tether Gold) cannot be handled correctly in a generic way. A token that always returns `false` but still mutates state will cause `safeTransfer` to revert on a successful operation. The only complete defense for such tokens is an explicit token allowlist.
+</Note>
+
+<Tip>
+When building a new protocol that must support arbitrary tokens, couple `SafeERC20` with a balance-diff check: record `balanceOf(address(this))` before and after the transfer and use the difference as the true credited amount.
+</Tip>

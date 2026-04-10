@@ -1,122 +1,83 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "Weird ERC20",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#141414",
+    "light": "#c2fa14",
+    "dark": "#5c7c14"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "tabs": [
-      {
-        "tab": "Guides",
-        "groups": [
-          {
-            "group": "Getting started",
-            "pages": [
-              "index",
-              "quickstart",
-              "development"
-            ]
-          },
-          {
-            "group": "Customization",
-            "pages": [
-              "essentials/settings",
-              "essentials/navigation"
-            ]
-          },
-          {
-            "group": "Writing content",
-            "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
-            ]
-          },
-          {
-            "group": "AI tools",
-            "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
-            ]
-          }
-        ]
-      },
-      {
-        "tab": "API reference",
-        "groups": [
-          {
-            "group": "API documentation",
-            "pages": [
-              "api-reference/introduction"
-            ]
-          },
-          {
-            "group": "Endpoint examples",
-            "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
-            ]
-          }
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
+  "favicon": "https://media.brand.dev/8018254a-66cc-4d8a-9c56-13f5107b7ee6.jpg",
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/d-xo/weird-erc20"
     }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/d-xo/weird-erc20"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Transfer Behaviors",
+            "pages": [
+              "tokens/missing-returns",
+              "tokens/reentrant-calls",
+              "tokens/fee-on-transfer",
+              "tokens/transfer-less-than-amount",
+              "tokens/no-revert-on-failure",
+              "tokens/revert-zero-value-transfers"
+            ]
+          },
+          {
+            "group": "Approval Behaviors",
+            "pages": [
+              "tokens/approval-race-protection",
+              "tokens/revert-approval-zero-address",
+              "tokens/revert-zero-value-approvals",
+              "tokens/revert-large-approvals",
+              "tokens/unusual-permit"
+            ]
+          },
+          {
+            "group": "Token Properties",
+            "pages": [
+              "tokens/balance-modifications",
+              "tokens/low-decimals",
+              "tokens/high-decimals",
+              "tokens/non-string-metadata",
+              "tokens/multiple-addresses"
+            ]
+          },
+          {
+            "group": "Admin Controls & Upgrades",
+            "pages": [
+              "tokens/blocklist",
+              "tokens/pausable",
+              "tokens/upgradable",
+              "tokens/flash-mintable"
+            ]
+          },
+          {
+            "group": "Security Guidance",
+            "pages": [
+              "guidance/integration-checklist",
+              "guidance/safe-patterns",
+              "guidance/known-exploits"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

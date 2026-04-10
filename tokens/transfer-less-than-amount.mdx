@@ -1,0 +1,102 @@
+---
+title: "Tokens That Transfer Less Than the Requested Amount"
+description: "cUSDCv3 uses a sentinel that transfers only the holder's balance. Vaults that credit the requested amount instead of actual receipt become insolvent."
+---
+
+Most ERC20 tokens transfer exactly the amount specified by the caller, but some tokens contain special-case logic in their transfer functions that causes them to move a different quantity. The most documented example is `cUSDCv3` (Compound's wrapped USDC), which treats `amount == type(uint256).max` as a sentinel value meaning "transfer my entire balance." If a protocol passes `type(uint256).max` as an amount and credits the user with that value, it will record a debt orders of magnitude larger than the tokens actually received. This page explains the behavior conceptually and shows how to write integrations that are immune to it.
+
+## Real-world examples
+
+| Token | Special-case behavior |
+|-------|----------------------|
+| cUSDCv3 (Compound v3 USDC) | `type(uint256).max` as `amount` transfers only the caller's current balance |
+
+<Note>
+This behavior is distinct from fee-on-transfer tokens. A fee-on-transfer token always delivers less than `amount`; this pattern only diverges from `amount` for specific sentinel values. The danger is that `type(uint256).max` is a common idiom for "maximum approval" and is sometimes also used as an amount argument to mean "everything I have."
+</Note>
+
+## How the behavior works
+
+In `cUSDCv3`, the `transferFrom` function contains logic equivalent to:
+
+```solidity
+function transferFrom(address src, address dst, uint256 amount) public returns (bool) {
+    // Special case: uint256 max means "transfer the full balance of src"
+    uint256 transferAmount = amount == type(uint256).max
+        ? balanceOf[src]
+        : amount;
+
+    // ... perform transfer of transferAmount, not amount
+    balanceOf[src] -= transferAmount;
+    balanceOf[dst] += transferAmount;
+
+    emit Transfer(src, dst, transferAmount);
+    return true;
+}
+```
+
+The function returns `true` and emits a `Transfer` event for the actual amount moved (`balanceOf[src]`), not for the `amount` argument passed in. From the perspective of the ABI return value, the call succeeded.
+
+## Integration risks
+
+**Vault insolvency.** A vault that calls `token.transferFrom(user, address(this), type(uint256).max)` and then stores `deposits[user] = type(uint256).max` has recorded a liability it can never cover. Any subsequent withdrawal for that amount will drain every other depositor's funds.
+
+**Protocol accounting drift.** Even with non-sentinel values, any token that can transfer less than `amount` without reverting will cause protocol accounting to diverge from reality over time if integrations do not measure actual receipt.
+
+**Silent success.** Because the function returns `true` and the transaction does not revert, standard success-checking code (e.g., `require(token.transferFrom(...))`) will not catch the discrepancy.
+
+## Defensive measures
+
+### Balance-difference accounting
+
+The universal defense against all "transfers less than amount" patterns is to measure the actual change in the contract's token balance:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+contract BalanceDiffVault {
+    using SafeERC20 for IERC20;
+
+    mapping(address => uint256) public deposits;
+
+    function deposit(IERC20 token, uint256 amount) external {
+        uint256 balanceBefore = token.balanceOf(address(this));
+
+        token.safeTransferFrom(msg.sender, address(this), amount);
+
+        uint256 received = token.balanceOf(address(this)) - balanceBefore;
+
+        // Credit exactly what arrived, regardless of what was requested
+        deposits[msg.sender] += received;
+    }
+}
+```
+
+### Explicit sentinel rejection
+
+If your protocol does not need to support `type(uint256).max` as an amount argument, reject it explicitly:
+
+```solidity
+function deposit(IERC20 token, uint256 amount) external {
+    require(amount != type(uint256).max, "sentinel value not allowed");
+
+    uint256 balanceBefore = token.balanceOf(address(this));
+    token.safeTransferFrom(msg.sender, address(this), amount);
+    uint256 received = token.balanceOf(address(this)) - balanceBefore;
+
+    require(received == amount, "transfer amount mismatch");
+    deposits[msg.sender] += amount;
+}
+```
+
+<Tip>
+The balance-difference pattern is the most robust approach and also handles fee-on-transfer tokens, making it a good default for any protocol that supports arbitrary or upgradable ERC20 tokens.
+</Tip>
+
+<Warning>
+Vault-type systems are the primary target of this vulnerability. If your contract stores a user's credited amount separately from the amount actually held, any divergence between "what was requested" and "what arrived" is a potential insolvency vector. Always measure receipt; never trust the input argument.
+</Warning>

@@ -1,0 +1,158 @@
+---
+title: "ERC20 Tokens That Revert When Approvals Exceed uint96"
+description: "UNI and COMP store allowances as uint96 and revert when approve() receives a value exceeding the uint96 maximum, breaking common max-approval patterns."
+---
+
+UNI and COMP are among the most widely integrated DeFi tokens, yet both carry a non-obvious constraint: their allowance and balance storage is typed as `uint96` rather than the `uint256` used by standard ERC20 implementations. As a result, any call to `approve()` or `transfer()` with a value that does not fit in a 96-bit integer will revert. This breaks the extremely common pattern of approving `type(uint256).max` as an "infinite approval" — the value silently overflows the `uint96` field. There is a special case in the implementation that converts `uint256(-1)` (i.e. `type(uint256).max`) into `type(uint96).max`, but other large `uint256` values that exceed `2**96 - 1` will cause a hard revert. Protocols that construct approval amounts from user input or compute them as fractions of `type(uint256).max` are particularly vulnerable.
+
+## Affected Tokens
+
+| Token | Network | Notes |
+|-------|---------|-------|
+| UNI (Uniswap) | Ethereum mainnet | Uses `uint96` for balances and allowances |
+| COMP (Compound) | Ethereum mainnet | Same implementation pattern as UNI |
+
+<Note>
+  The special case for `type(uint256).max` means that the canonical "infinite approval" pattern still works as intended — but the stored allowance will be `type(uint96).max` (~79 billion tokens at 18 decimals), not `type(uint256).max`. This matters for systems that read back the allowance and compare it to `type(uint256).max`.
+</Note>
+
+## Contract Implementation
+
+The reference implementation below shows the full `uint96` token. Pay attention to the `safe96` helper, which is called on every input value, and the special-cased `approve` function that handles `type(uint).max` explicitly before calling `safe96`.
+
+```solidity
+// Copyright (C) 2017, 2018, 2019, 2020 dbrock, rain, mrchico, d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+contract Uint96ERC20 {
+    // --- ERC20 Data ---
+    string  public constant name = "Token";
+    string  public constant symbol = "TKN";
+    uint8   public decimals = 18;
+    uint96  internal supply;
+
+    mapping (address => uint96)                      internal balances;
+    mapping (address => mapping (address => uint96)) internal allowances;
+
+    event Approval(address indexed src, address indexed guy, uint wad);
+    event Transfer(address indexed src, address indexed dst, uint wad);
+
+    // --- Math ---
+    function add(uint96 x, uint96 y) internal pure returns (uint96 z) {
+        require((z = x + y) >= x);
+    }
+    function sub(uint96 x, uint96 y) internal pure returns (uint96 z) {
+        require((z = x - y) <= x);
+    }
+    function safe96(uint256 n) internal pure returns (uint96) {
+        require(n < 2**96);
+        return uint96(n);
+    }
+
+    // --- Init ---
+    constructor(uint96 _supply) public {
+        supply = _supply;
+        balances[msg.sender] = _supply;
+        emit Transfer(address(0), msg.sender, _supply);
+    }
+
+    // --- Getters ---
+    function totalSupply() external view returns (uint) {
+        return supply;
+    }
+    function balanceOf(address usr) external view returns (uint) {
+        return balances[usr];
+    }
+    function allowance(address src, address dst) external view returns (uint) {
+        return allowances[src][dst];
+    }
+
+    // --- Token ---
+    function transfer(address dst, uint wad) virtual public returns (bool) {
+        return transferFrom(msg.sender, dst, wad);
+    }
+    function transferFrom(address src, address dst, uint wad) virtual public returns (bool) {
+        uint96 amt = safe96(wad);
+
+        if (src != msg.sender && allowances[src][msg.sender] != type(uint96).max) {
+            allowances[src][msg.sender] = sub(allowances[src][msg.sender], amt);
+        }
+
+        balances[src] = sub(balances[src], amt);
+        balances[dst] = add(balances[dst], amt);
+        emit Transfer(src, dst, wad);
+        return true;
+    }
+    function approve(address usr, uint wad) virtual public returns (bool) {
+        uint96 amt;
+        if (wad == type(uint).max) {
+            amt = type(uint96).max;
+        } else {
+            amt = safe96(wad);
+        }
+
+        allowances[msg.sender][usr] = amt;
+
+        emit Approval(msg.sender, usr, amt);
+        return true;
+    }
+}
+```
+
+## Integration Risks
+
+**`type(uint256).max` approval is stored as `type(uint96).max`.** The special case converts the max uint256 sentinel to the max uint96 value before storage. Any downstream code that reads the allowance back and checks `allowance == type(uint256).max` will get `false`, even though the intent was an infinite approval. This can cause unexpected re-approval attempts or incorrect access-control logic.
+
+**Large computed values revert.** Any approval amount derived from arithmetic on `uint256` values — for example, `userBalance * 10` or a fraction of `type(uint256).max` — may silently exceed `2**96 - 1` and cause a revert. This is especially common in protocols that compute max approvals as relative amounts rather than absolute constants.
+
+**Transfer amounts are also bounded.** The same `safe96` guard applies in `transferFrom`. A transfer of more than `2**96 - 1` tokens will revert, even if the sender has sufficient balance. In practice this limit (approximately 79 billion tokens at 18 decimal places) is very unlikely to be hit for UNI or COMP, but it is a hard bound that could affect synthetic or test scenarios.
+
+<Warning>
+  Do not read back the stored allowance and compare it to `type(uint256).max` to determine whether an "infinite" approval is in effect. For `uint96` tokens, this check will always return `false` even after a `type(uint256).max` approval call succeeds. Use `allowance >= amount` instead.
+</Warning>
+
+## Defensive Measures
+
+Use `type(uint96).max` as the safe maximum approval amount when you need an effectively unlimited allowance for tokens with this constraint. This value passes the `safe96` guard and is treated as the infinite-allowance sentinel in `transferFrom`.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IERC20} from "./IERC20.sol";
+
+/// Maximum approval amount safe for uint96-bounded tokens (UNI, COMP).
+/// Approximately 79.2 billion tokens at 18 decimals.
+uint256 constant MAX_UINT96 = type(uint96).max;
+
+/// @notice Approve a spender using a uint96-safe maximum.
+/// @param token   The ERC20 token (e.g. UNI or COMP).
+/// @param spender The address to approve.
+function approveMax96(IERC20 token, address spender) internal {
+    // type(uint256).max is also accepted and stored as uint96 max,
+    // but using MAX_UINT96 avoids any ambiguity when reading the allowance back.
+    token.approve(spender, MAX_UINT96);
+}
+```
+
+When checking whether an allowance is effectively "unlimited" for a `uint96` token, compare against `type(uint96).max` rather than `type(uint256).max`:
+
+```solidity
+/// @notice Check if the allowance is effectively unlimited for a uint96 token.
+function hasUnlimitedAllowance(
+    IERC20 token,
+    address owner,
+    address spender
+) internal view returns (bool) {
+    uint256 current = token.allowance(owner, spender);
+    // Both type(uint256).max and type(uint96).max indicate unlimited intent,
+    // but only type(uint96).max will be stored after the special-case conversion.
+    return current == type(uint96).max || current == type(uint256).max;
+}
+```
+
+<Tip>
+  When writing approval logic that must work across both standard ERC20 tokens and `uint96` tokens, cap your approval amounts at `type(uint96).max`. This value is accepted without reversion by both token types and is large enough to be functionally unlimited for any realistic token supply.
+</Tip>

@@ -1,0 +1,210 @@
+---
+title: "DAI-Style Permit: Non-EIP2612 Permit in ERC20 Tokens"
+description: "DAI and several tokens use a non-EIP2612 permit() with a bool toggle and nonce, making signatures incompatible with standard EIP2612 permit integrations."
+---
+
+EIP2612 standardized a `permit()` function that allows token approvals to be authorized via a signed message, eliminating the need for a separate on-chain approval transaction. However, DAI — and a family of tokens that adopted DAI's original implementation — shipped a `permit()` function with a fundamentally different signature and semantics before EIP2612 was finalized. Where EIP2612 accepts a specific `uint256 value` and a `uint256 deadline`, the DAI-style permit uses a `bool allowed` flag (either grant maximum allowance or revoke entirely) and a `uint256 expiry` alongside an explicit `uint256 nonce`. This page covers the DAI-style variant, the tokens affected, and the integration hazards it creates — including the risk of "phantom functions," where a token without any `permit` implementation silently accepts and no-ops the call.
+
+## Affected Tokens
+
+| Token | Notes |
+|-------|-------|
+| DAI | Original implementation; the reference for this variant |
+| RAI | Reflexer's stablecoin; adopts the DAI permit model |
+| GLM | Golem Network Token |
+| STAKE | xDai STAKE governance token |
+| CHAI | DAI-based savings wrapper |
+| HAKKA | Hakka Finance governance token |
+| USDFL | Equalizer stablecoin |
+| HNY | Honey (1Hive) governance token |
+
+<Note>
+  A community-maintained list of tokens with DAI-like permit functions is available at [yashnaman/tokensWithPermitFunctionList](https://github.com/yashnaman/tokensWithPermitFunctionList/blob/master/hasDAILikePermitFunctionTokenList.json).
+</Note>
+
+## Contract Implementation
+
+The full reference implementation below shows the DAI-style permit. Note the signature: `permit(address holder, address spender, uint256 nonce, uint256 expiry, bool allowed, uint8 v, bytes32 r, bytes32 s)`. The `allowed` boolean determines whether the allowance is set to `type(uint256).max` (grant) or `0` (revoke). There is no way to set a specific intermediate value through `permit`.
+
+```solidity
+// Copyright (C) 2017, 2018, 2019, 2020 dbrock, rain, mrchico, d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+contract Math {
+    // --- Math ---
+    function add(uint x, uint y) internal pure returns (uint z) {
+        require((z = x + y) >= x);
+    }
+    function sub(uint x, uint y) internal pure returns (uint z) {
+        require((z = x - y) <= x);
+    }
+}
+
+contract DaiPermit is Math {
+    // --- ERC20 Data ---
+    string  public constant name = "Token";
+    string  public constant symbol = "TKN";
+    uint8   public decimals = 18;
+    uint256 public totalSupply;
+    bytes32 public constant PERMIT_TYPEHASH = 0xea2aa0a1be11a07ed86d755c93467f4f82362b452371d1ba94d1715123511acb;
+    bytes32 public immutable DOMAIN_SEPARATOR = keccak256(
+        abi.encode(
+            keccak256('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)'),
+            keccak256(bytes(name)),
+            keccak256(bytes('1')),
+            block.chainid,
+            address(this)
+        )
+    );
+
+    mapping (address => uint)                      public balanceOf;
+    mapping (address => mapping (address => uint)) public allowance;
+    mapping (address => uint)                      public nonces;
+
+    event Approval(address indexed src, address indexed guy, uint wad);
+    event Transfer(address indexed src, address indexed dst, uint wad);
+
+    // --- Init ---
+    constructor(uint _totalSupply) public {
+        totalSupply = _totalSupply;
+        balanceOf[msg.sender] = _totalSupply;
+        emit Transfer(address(0), msg.sender, _totalSupply);
+    }
+
+    // --- Token ---
+    function transfer(address dst, uint wad) virtual public returns (bool) {
+        return transferFrom(msg.sender, dst, wad);
+    }
+    function transferFrom(address src, address dst, uint wad) virtual public returns (bool) {
+        require(balanceOf[src] >= wad, "insufficient-balance");
+        if (src != msg.sender && allowance[src][msg.sender] != type(uint).max) {
+            require(allowance[src][msg.sender] >= wad, "insufficient-allowance");
+            allowance[src][msg.sender] = sub(allowance[src][msg.sender], wad);
+        }
+        balanceOf[src] = sub(balanceOf[src], wad);
+        balanceOf[dst] = add(balanceOf[dst], wad);
+        emit Transfer(src, dst, wad);
+        return true;
+    }
+    function approve(address usr, uint wad) virtual public returns (bool) {
+        allowance[msg.sender][usr] = wad;
+        emit Approval(msg.sender, usr, wad);
+        return true;
+    }
+    function permit(address holder, address spender, uint256 nonce, uint256 expiry,
+                    bool allowed, uint8 v, bytes32 r, bytes32 s) external
+    {
+        bytes32 digest =
+            keccak256(abi.encodePacked(
+                "\x19\x01",
+                DOMAIN_SEPARATOR,
+                keccak256(abi.encode(PERMIT_TYPEHASH,
+                                     holder,
+                                     spender,
+                                     nonce,
+                                     expiry,
+                                     allowed))
+        ));
+
+        require(holder != address(0), "Dai/invalid-address-0");
+        require(holder == ecrecover(digest, v, r, s), "Dai/invalid-permit");
+        require(expiry == 0 || block.timestamp <= expiry, "Dai/permit-expired");
+        require(nonce == nonces[holder]++, "Dai/invalid-nonce");
+        uint wad = allowed ? type(uint256).max : 0;
+        allowance[holder][spender] = wad;
+    }
+}
+```
+
+## EIP2612 vs DAI-style: Signature Comparison
+
+The two `permit` function signatures are structurally incompatible. A contract expecting one will fail silently or revert when given the other.
+
+| Parameter | EIP2612 | DAI-style |
+|-----------|---------|-----------|
+| Who signs | `owner` | `holder` |
+| Spender | `spender` | `spender` |
+| Amount | `uint256 value` | `bool allowed` (max or zero) |
+| Time limit | `uint256 deadline` | `uint256 expiry` |
+| Replay guard | Implicit (increments on use) | `uint256 nonce` (explicit, passed by caller) |
+| Signature | `v, r, s` | `v, r, s` |
+
+The key behavioral differences:
+
+- **Granular amounts vs binary toggle.** EIP2612 lets you permit any specific value. The DAI-style only sets `type(uint256).max` (when `allowed = true`) or `0` (when `allowed = false`).
+- **Explicit nonce.** The caller must supply the current nonce value, which requires an on-chain read before signing. EIP2612 uses the nonce implicitly.
+- **Typehash.** The DAI `PERMIT_TYPEHASH` encodes `allowed` (a `bool`), not `value` (a `uint256`), so signatures are not interchangeable even if the calling convention were adapted.
+
+## Integration Risks
+
+**Phantom functions — the silent no-op hazard.**  Tokens that do not implement `permit` at all may not revert when `permit` is called on them. If a contract calls `token.permit(...)` on an address that has no `permit` function, the low-level call will succeed with no return data (a contract's fallback may absorb it), leaving the caller to proceed as if the permit had been granted — without any actual allowance being set. This has been analyzed in detail in the [Dedaub phantom functions writeup](https://media.dedaub.com/phantom-functions-and-the-billion-dollar-no-op-c56f062ae49f).
+
+<Warning>
+  Never assume that a successful `permit` call has actually updated the allowance. After calling `permit`, always read back `token.allowance(holder, spender)` to confirm the expected value is present before proceeding with `transferFrom`. If the allowance is not set, revert with a clear error rather than silently continuing with an unexpected state.
+</Warning>
+
+**Signature built for EIP2612 will not verify on DAI-style tokens.** The `PERMIT_TYPEHASH` differs, and the parameters encoded in the digest differ (`value` vs `allowed`). Sending an EIP2612-formatted signature to a DAI-style `permit` will produce an invalid digest and revert at the `ecrecover` check — unless the token has no `permit` function, in which case it may silently succeed as a no-op.
+
+**Nonce handling requires a pre-call read.** Because the DAI-style `permit` requires the caller to supply the current nonce explicitly, any off-chain signing flow must query `nonces(holder)` before constructing the signature. Nonce mismatches (e.g. from concurrent permit calls) cause reverts.
+
+## Defensive Measures
+
+Check the allowance after every `permit` call, regardless of whether the call appears to have succeeded:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IDaiPermit {
+    function permit(
+        address holder,
+        address spender,
+        uint256 nonce,
+        uint256 expiry,
+        bool allowed,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    function allowance(address, address) external view returns (uint256);
+}
+
+/// @notice Call DAI-style permit and verify the allowance was actually set.
+/// @dev    Reverts if the allowance is not the expected value after the call.
+function daiPermitAndVerify(
+    IDaiPermit token,
+    address holder,
+    address spender,
+    uint256 nonce,
+    uint256 expiry,
+    bool allowed,
+    uint8 v,
+    bytes32 r,
+    bytes32 s
+) internal {
+    token.permit(holder, spender, nonce, expiry, allowed, v, r, s);
+
+    uint256 expected = allowed ? type(uint256).max : 0;
+    require(
+        token.allowance(holder, spender) == expected,
+        "permit: allowance not set (phantom function?)"
+    );
+}
+```
+
+<Tip>
+  [Uniswap Permit2](https://github.com/Uniswap/permit2) provides a unified permit system that works with any ERC20 token, regardless of whether the token itself implements EIP2612 or the DAI-style variant. Permit2 handles the signature layer independently of the token, eliminating the phantom function risk and the incompatibility between permit variants. For new integrations that need gasless approvals across a broad token set, Permit2 is the recommended approach.
+</Tip>
+
+When building off-chain signing utilities for DAI-style tokens, construct the typed data with the correct typehash and field set:
+
+```solidity
+// The DAI permit typehash — distinct from the EIP2612 typehash.
+// EIP2612: keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)")
+// DAI:     keccak256("Permit(address holder,address spender,uint256 nonce,uint256 expiry,bool allowed)")
+bytes32 constant DAI_PERMIT_TYPEHASH =
+    0xea2aa0a1be11a07ed86d755c93467f4f82362b452371d1ba94d1715123511acb;
+```

@@ -1,80 +1,163 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quickstart: Install Weird ERC20 and Write Foundry Tests"
+description: "Install weird-erc20 and use its reference token implementations in Foundry tests to validate that your ERC20 integration handles non-standard behaviors."
 ---
 
-## Get started in three steps
+The Weird ERC20 library ships as an npm package containing all reference token implementations as Solidity source files. You can install it into any Foundry project and import the contracts directly into your test suite to exercise your integration against tokens that exhibit real-world non-standard behaviors.
 
-Get your documentation site running locally and make your first customization.
+## Installation
 
-### Step 1: Set up your local environment
+Install the package using your preferred package manager. The package exposes all contracts under `src/`.
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+<CodeGroup>
 
-### Step 2: Deploy your changes
+```bash npm
+npm install weird-erc20
+```
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+```bash yarn
+yarn add weird-erc20
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+```bash pnpm
+pnpm add weird-erc20
+```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+</CodeGroup>
 
-### Step 3: Go live
+After installing, Foundry resolves the package through your `node_modules` directory. Add a remapping in `foundry.toml` or `remappings.txt` so Solidity imports resolve correctly.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+```toml foundry.toml
+[profile.default]
+remappings = [
+  "weird-erc20/=node_modules/weird-erc20/src/"
+]
+```
 
-## Next steps
+## Getting started
 
-Now that you have your docs running, explore these key features:
+<Steps>
+  <Step title="Import the token contracts">
+    Import the specific token implementations you want to test against. Each file in `src/` is a self-contained contract with no external dependencies beyond the base `ERC20.sol`.
 
-<CardGroup cols={2}>
+    ```solidity
+    import {MissingReturnToken} from "weird-erc20/MissingReturns.sol";
+    import {ReentrantToken} from "weird-erc20/Reentrant.sol";
+    import {TransferFeeToken} from "weird-erc20/TransferFee.sol";
+    import {BlockableToken} from "weird-erc20/BlockList.sol";
+    ```
+  </Step>
+  <Step title="Deploy tokens in your test setUp">
+    Instantiate whichever tokens your integration needs to handle. Each token constructor accepts a `totalSupply` argument. The deploying address receives the full supply.
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+    ```solidity
+    contract MyProtocolTest is Test {
+        MissingReturnToken missingReturn;
+        TransferFeeToken   feeToken;
+        BlockableToken     blockable;
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+        function setUp() public {
+            missingReturn = new MissingReturnToken(1_000_000e18);
+            feeToken      = new TransferFeeToken(1_000_000e18, 100); // 100 wei fee per transfer
+            blockable     = new BlockableToken(1_000_000e18);
+        }
+    }
+    ```
+  </Step>
+  <Step title="Write tests against non-standard behavior">
+    Call your protocol's integration code with the weird token and assert the outcome. The example below checks that a vault contract correctly handles a token that omits the `bool` return value from `transfer` and `transferFrom`.
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+    ```solidity
+    function test_deposit_missingReturn() public {
+        // Approve the vault to spend the deployer's tokens
+        // MissingReturnToken.approve() has no return value — verify your
+        // integration does not expect one (use SafeERC20 or a low-level call)
+        missingReturn.approve(address(vault), 500e18);
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+        uint256 balanceBefore = missingReturn.balanceOf(address(this));
 
-</CardGroup>
+        vault.deposit(address(missingReturn), 500e18);
+
+        // The vault should have received the full amount
+        assertEq(missingReturn.balanceOf(address(vault)), 500e18);
+        assertEq(missingReturn.balanceOf(address(this)), balanceBefore - 500e18);
+    }
+    ```
+  </Step>
+  <Step title="Test fee-on-transfer accounting">
+    Tokens like `STA` and `PAXG` deduct a fee from the transferred amount, so the recipient receives less than requested. Systems that credit a user with the input amount rather than the received amount will hold an accounting shortfall.
+
+    ```solidity
+    function test_deposit_feeOnTransfer() public {
+        // feeToken charges 100 wei per transfer
+        feeToken.approve(address(vault), 500e18);
+
+        uint256 vaultBalanceBefore = feeToken.balanceOf(address(vault));
+
+        vault.deposit(address(feeToken), 500e18);
+
+        uint256 vaultBalanceAfter = feeToken.balanceOf(address(vault));
+        uint256 actualReceived    = vaultBalanceAfter - vaultBalanceBefore;
+
+        // The vault received less than 500e18 — assert it credited the user
+        // with actualReceived, not the input amount
+        assertLt(actualReceived, 500e18);
+        assertEq(vault.userBalance(address(this), address(feeToken)), actualReceived);
+    }
+    ```
+  </Step>
+</Steps>
+
+## Complete example: testing MissingReturns
+
+The `MissingReturnToken` mimics tokens like `USDT` and `BNB` that omit the `bool` return value from their ERC20 methods. Calling `transfer()` or `transferFrom()` on these tokens from a contract that expects a return value will cause the transaction to revert or silently succeed with unexpected results depending on the ABI decoder.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Test} from "forge-std/Test.sol";
+import {MissingReturnToken} from "weird-erc20/MissingReturns.sol";
+
+contract MissingReturnsTest is Test {
+    MissingReturnToken token;
+    address alice = makeAddr("alice");
+
+    function setUp() public {
+        // Deploy with 1 million tokens, all sent to address(this)
+        token = new MissingReturnToken(1_000_000e18);
+
+        // Fund alice for testing
+        token.transfer(alice, 1_000e18);
+    }
+
+    function test_transfer_noReturnValue() public {
+        // Low-level call succeeds even though no bool is returned
+        (bool ok,) = address(token).call(
+            abi.encodeWithSignature("transfer(address,uint256)", alice, 100e18)
+        );
+        assertTrue(ok, "call should succeed");
+
+        // Balance updated correctly despite missing return value
+        assertEq(token.balanceOf(alice), 1_100e18);
+    }
+
+    function test_approve_and_transferFrom_noReturnValue() public {
+        vm.prank(alice);
+        // approve() also returns nothing — use low-level call or SafeERC20
+        (bool ok,) = address(token).call(
+            abi.encodeWithSignature("approve(address,uint256)", address(this), 500e18)
+        );
+        assertTrue(ok);
+
+        // transferFrom should move tokens correctly
+        uint256 before = token.balanceOf(address(this));
+        token.transferFrom(alice, address(this), 500e18);
+        assertEq(token.balanceOf(address(this)), before + 500e18);
+    }
+}
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  The library includes more than 20 token implementations covering every major non-standard behavior category. Browse the full catalog in the [Transfer Behaviors](/tokens/missing-returns), [Approval Behaviors](/tokens/approval-race-protection), [Token Properties](/tokens/balance-modifications), and [Admin Controls](/tokens/blocklist) sections.
 </Note>

@@ -1,0 +1,96 @@
+---
+title: 'ERC20 Tokens with More Than 18 Decimal Places (High)'
+description: 'YAM-V2 has 24 decimals; the reference contract uses 50. Multiplying high-decimal token amounts by 1e18 scaling factors can overflow uint256 unexpectedly.'
+---
+
+The ERC20 standard places no upper bound on the `decimals` field, and some tokens in production exceed the conventional maximum of 18. YAM-V2 uses 24 decimals, meaning one token is represented as `1_000_000_000_000_000_000_000_000` on-chain — a value that, when multiplied by common scaling factors like `1e18`, overflows a `uint256`. Protocols that perform arithmetic using `10 ** decimals` or that multiply token amounts by 18-decimal price feeds are vulnerable to overflow-induced reverts, creating liveness risk that can freeze user funds or permanently disable core protocol functionality.
+
+## Real-world examples
+
+| Token | Decimals | One unit on-chain |
+|---|---|---|
+| **YAM-V2** | 24 | `1e24` |
+
+## Reference implementation
+
+The `HighDecimalToken` from the weird-erc20 library demonstrates an extreme case: `decimals` set to `50`, far beyond what any `uint256` arithmetic can safely accommodate.
+
+```solidity
+// Copyright (C) 2020 d-xo
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity >=0.6.12;
+
+import {ERC20} from "./ERC20.sol";
+
+contract HighDecimalToken is ERC20 {
+    constructor(uint _totalSupply) ERC20(_totalSupply) public {
+        decimals = 50;
+    }
+}
+```
+
+## Integration risks
+
+<Warning>
+Multiplying a high-decimal token amount by `1e18` (a common operation when computing prices or exchange rates) can overflow `uint256` and revert. With Solidity 0.8.x checked arithmetic, this reverts the transaction; with earlier versions or `unchecked` blocks, it silently wraps to an incorrect value.
+</Warning>
+
+**Price feed multiplication overflow.** A common pattern for computing a token's USD value is:
+
+```solidity
+// Overflow example with a 24-decimal token
+// amount = 1 token = 1e24
+// price  = $1, represented with 18-decimal precision = 1e18
+uint256 usdValue = (amount * price) / 1e18;
+
+// Computation: 1e24 * 1e18 = 1e42
+// uint256 max  = ~1.15e77  — this particular case fits, but:
+
+// amount = 1e24, price = 1e18, scaled by another 1e18 factor (e.g., for interest):
+// 1e24 * 1e18 * 1e18 = 1e60  — still fits uint256
+
+// However, with decimals = 50:
+// amount = 1e50, price = 1e18
+// 1e50 * 1e18 = 1e68  — fits uint256 max (~1.15e77)
+// 1e50 * 1e18 * 1e18 = 1e86  — OVERFLOWS uint256
+```
+
+**Scaling factor computation.** Code that computes `10 ** decimals` to normalize amounts will overflow with `decimals >= 78` (since `10**78 > uint256 max`), and will produce values too large for safe multiplication at even lower decimal counts depending on context.
+
+**Share price and ratio calculations.** Vault share price formulas of the form `(totalAssets * 1e18) / totalShares` overflow when `totalAssets` carries a high-decimal token amount multiplied by the `1e18` precision factor.
+
+## Defensive measures
+
+<Tip>
+Check `token.decimals()` at integration time. If the value exceeds your protocol's safe arithmetic range, reject the token explicitly rather than allowing silent overflow or unexpected reverts.
+</Tip>
+
+**Enforce a maximum decimal count.** Add a guard during token registration that rejects tokens with decimals above a safe threshold:
+
+```solidity
+function addSupportedToken(address token) external onlyOwner {
+    uint8 d = IERC20Metadata(token).decimals();
+    require(d <= 18, "decimals exceed maximum supported value");
+    supportedTokens[token] = true;
+}
+```
+
+**Normalize to internal precision before arithmetic.** If you must support high-decimal tokens, scale amounts down to a fixed internal precision immediately on ingress and scale back up on egress:
+
+```solidity
+function normalize(address token, uint256 amount) internal view returns (uint256) {
+    uint8 d = IERC20Metadata(token).decimals();
+    if (d > 18) {
+        // Divide down — may lose sub-unit precision, but prevents overflow
+        return amount / (10 ** (d - 18));
+    }
+    return amount;
+}
+```
+
+**Use checked arithmetic throughout.** Solidity 0.8.x enables checked arithmetic by default. Avoid `unchecked` blocks in code paths that process token amounts, so overflows surface as reverts rather than silent value corruption.
+
+**Use SafeMath or overflow-aware libraries on older compilers.** For codebases targeting Solidity below 0.8.x, use OpenZeppelin's SafeMath library on every arithmetic operation involving token amounts, ensuring overflow is caught as a revert rather than wrapping silently.
+
+**Test with extreme decimal values.** Write fuzz tests that supply `decimals` values up to 77 (the practical limit before `10 ** decimals` itself overflows) to ensure your protocol reverts gracefully rather than producing incorrect results.
